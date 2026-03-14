@@ -29,6 +29,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.strict:
         from ._seccomp import DEFAULT_ALLOW_SYSCALLS
         cli_kwargs["allow_syscalls"] = DEFAULT_ALLOW_SYSCALLS
+    if args.chroot:
+        cli_kwargs["chroot"] = args.chroot
     if args.privileged:
         cli_kwargs["privileged"] = True
     if args.fs_isolation:
@@ -181,6 +183,8 @@ def main() -> None:
     run_p.add_argument("-t", "--timeout", type=float, help="Timeout in seconds")
     run_p.add_argument("--strict", action="store_true",
                        help="Allowlist mode: only permit known-safe syscalls")
+    run_p.add_argument("--chroot", metavar="PATH",
+                       help="Use directory as root filesystem (requires --privileged)")
     run_p.add_argument("--privileged", action="store_true",
                        help="Run as root inside a user namespace")
     run_p.add_argument("--net-bind", action="append", metavar="PORT",
