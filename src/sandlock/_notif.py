@@ -77,9 +77,13 @@ SECCOMP_IOCTL_NOTIF_RECV = _ioc(_IOC_WRITE | _IOC_READ, 0, _SECCOMP_NOTIF_SIZE)
 SECCOMP_IOCTL_NOTIF_SEND = _ioc(_IOC_WRITE | _IOC_READ, 1, _SECCOMP_NOTIF_RESP_SIZE)
 SECCOMP_IOCTL_NOTIF_ID_VALID = _ioc(_IOC_WRITE, 2, 8)  # u64
 SECCOMP_IOCTL_NOTIF_ADDFD = _ioc(_IOC_WRITE | _IOC_READ, 3, _SECCOMP_NOTIF_ADDFD_SIZE)
+SECCOMP_IOCTL_NOTIF_SET_FLAGS = _ioc(_IOC_WRITE, 4, 8)  # u64, Linux 6.7+
 
 # Response flag: let the original syscall proceed in the kernel
 SECCOMP_USER_NOTIF_FLAG_CONTINUE = 1
+
+# Notification fd flag: wake child on supervisor's CPU (4x latency reduction)
+SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP = 1 << 0
 
 
 # --- ctypes structs ---
@@ -371,6 +375,14 @@ class NotifSupervisor:
 
     def start(self) -> None:
         """Start the supervisor thread."""
+        # Enable synchronous wake-up mode (Linux 6.7+) for ~4x lower
+        # notification latency.  Silently ignored on older kernels.
+        flags = ctypes.c_uint64(SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP)
+        _libc.ioctl(
+            ctypes.c_int(self._notify_fd),
+            ctypes.c_ulong(SECCOMP_IOCTL_NOTIF_SET_FLAGS),
+            ctypes.byref(flags),
+        )
         self._thread = threading.Thread(
             target=self._run, name="sandlock-notif", daemon=True,
         )

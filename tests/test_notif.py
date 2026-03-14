@@ -27,7 +27,9 @@ from sandlock._notif import (
     SECCOMP_IOCTL_NOTIF_SEND,
     SECCOMP_IOCTL_NOTIF_ID_VALID,
     SECCOMP_IOCTL_NOTIF_ADDFD,
+    SECCOMP_IOCTL_NOTIF_SET_FLAGS,
     SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP,
     SeccompNotif,
     SeccompNotifResp,
     SeccompNotifAddfd,
@@ -310,6 +312,14 @@ class TestIocConstants(unittest.TestCase):
     def test_addfd_ioctl(self):
         expected = (3 << 30) | (_SECCOMP_NOTIF_ADDFD_SIZE << 16) | (0x21 << 8) | 3
         self.assertEqual(SECCOMP_IOCTL_NOTIF_ADDFD, expected)
+
+    def test_set_flags_ioctl(self):
+        # direction = _IOC_WRITE only = 1, nr=4, size=8 (u64)
+        expected = (1 << 30) | (8 << 16) | (0x21 << 8) | 4
+        self.assertEqual(SECCOMP_IOCTL_NOTIF_SET_FLAGS, expected)
+
+    def test_sync_wake_up_flag(self):
+        self.assertEqual(SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP, 1)
 
 
 class TestCtypesStructs(unittest.TestCase):
