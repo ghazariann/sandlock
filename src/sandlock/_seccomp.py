@@ -50,6 +50,7 @@ SECCOMP_RET_KILL_PROCESS = 0x80000000
 # seccomp() syscall constants (not prctl — needed for USER_NOTIF)
 SECCOMP_SET_MODE_FILTER = 1
 SECCOMP_FILTER_FLAG_NEW_LISTENER = 1 << 3
+SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV = 1 << 5  # Linux 5.19+
 
 # seccomp_data offsets (architecture-independent layout)
 # struct seccomp_data { u32 nr, u32 arch, u64 instruction_pointer, u64 args[6] }

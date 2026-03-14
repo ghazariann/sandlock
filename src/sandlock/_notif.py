@@ -37,6 +37,7 @@ from ._seccomp import (
     OFFSET_ARCH,
     OFFSET_NR,
     SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
     SECCOMP_RET_ALLOW,
     SECCOMP_RET_ERRNO,
     SECCOMP_RET_KILL_PROCESS,
@@ -244,14 +245,25 @@ def install_notif_filter(
     prog.len = n_insns
     prog.filter = ctypes.addressof(buf)
 
-    # seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog)
+    # seccomp(SECCOMP_SET_MODE_FILTER, flags, &prog)
+    # WAIT_KILLABLE_RECV (5.19+) prevents signals from aborting
+    # notifications while the supervisor is handling them.
     __NR_seccomp = _SYSCALL_NR["seccomp"]
+    flags = SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
     fd = _libc.syscall(
         ctypes.c_long(__NR_seccomp),
         ctypes.c_uint(SECCOMP_SET_MODE_FILTER),
-        ctypes.c_uint(SECCOMP_FILTER_FLAG_NEW_LISTENER),
+        ctypes.c_uint(flags),
         ctypes.byref(prog),
     )
+    if fd < 0:
+        # Fall back without WAIT_KILLABLE_RECV on older kernels
+        fd = _libc.syscall(
+            ctypes.c_long(__NR_seccomp),
+            ctypes.c_uint(SECCOMP_SET_MODE_FILTER),
+            ctypes.c_uint(SECCOMP_FILTER_FLAG_NEW_LISTENER),
+            ctypes.byref(prog),
+        )
     if fd < 0:
         err = ctypes.get_errno()
         raise NotifError(f"seccomp(SET_MODE_FILTER, NEW_LISTENER): {os.strerror(err)}")
