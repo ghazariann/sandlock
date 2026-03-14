@@ -14,15 +14,17 @@ sandlock run -w /tmp -r /usr -m 512M -- python3 untrusted.py
 Containers and VMs are powerful but heavy. Sandlock targets the gap: strict
 confinement without image builds, overlay filesystems, or root privileges.
 
-| Feature | Sandlock | Container | gVisor |
-|---|---|---|---|
-| Root required | No | Yes* | Yes |
-| Image build | No | Yes | Yes |
-| Startup time | ~1 ms (fork) | ~200 ms | ~100 ms |
-| Filesystem isolation | Landlock | Overlay | ptrace/KVM |
-| Network isolation | Landlock + seccomp notif | Network namespace | Sentry kernel |
-| Syscall filtering | seccomp-bpf | seccomp | Sentry kernel |
-| Resource limits | seccomp notif + rlimit | cgroup v2 | cgroup v2 |
+| Feature | Sandlock | Container | MicroVM (Firecracker) | gVisor |
+|---|---|---|---|---|
+| Root required | No | Yes* | Yes (KVM) | Yes |
+| Image build | No | Yes | Yes | Yes |
+| Startup time | ~1 ms (fork) | ~200 ms | ~100 ms | ~100 ms |
+| Kernel | Shared | Shared | Separate guest | Shared (sentry) |
+| Filesystem isolation | Landlock | Overlay | Block-level (QCOW2) | ptrace/KVM |
+| Network isolation | Landlock + seccomp notif | Network namespace | TAP device | Sentry kernel |
+| Syscall filtering | seccomp-bpf | seccomp | N/A (full kernel) | Sentry kernel |
+| Resource limits | seccomp notif + rlimit | cgroup v2 | VM config | cgroup v2 |
+| Checkpoint/restore | ptrace + BranchFS | CRIU | VM snapshot | N/A |
 
 \* Rootless containers exist but have significant limitations.
 
