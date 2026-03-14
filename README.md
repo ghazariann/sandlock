@@ -24,6 +24,7 @@ confinement without image builds, overlay filesystems, or root privileges.
 | Network isolation | Landlock + seccomp notif | Network namespace | TAP device | Sentry kernel |
 | Syscall filtering | seccomp-bpf | seccomp | N/A (full kernel) | Sentry kernel |
 | Resource limits | seccomp notif + rlimit | cgroup v2 | VM config | cgroup v2 |
+| Memory sharing | COW (fork), zero-copy | Bind-mount + re-init | Shared mem (explicit) | N/A |
 | Nesting | Native (fork) | Complex (DinD/DooD) | Not supported | Supported |
 | Checkpoint/restore | ptrace + BranchFS | CRIU | VM snapshot | N/A |
 
