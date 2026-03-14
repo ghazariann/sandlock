@@ -14,43 +14,44 @@ def cmd_run(args: argparse.Namespace) -> int:
     from .policy import Policy
     from .sandbox import Sandbox
 
-    policy_kwargs: dict = {}
+    # Build CLI overrides dict
+    cli_kwargs: dict = {}
     if args.writable:
-        policy_kwargs["fs_writable"] = args.writable
+        cli_kwargs["fs_writable"] = args.writable
     if args.readable:
-        policy_kwargs["fs_readable"] = args.readable
+        cli_kwargs["fs_readable"] = args.readable
     if args.memory:
-        policy_kwargs["max_memory"] = args.memory
+        cli_kwargs["max_memory"] = args.memory
     if args.processes:
-        policy_kwargs["max_processes"] = args.processes
+        cli_kwargs["max_processes"] = args.processes
     if args.cpu:
-        policy_kwargs["max_cpu"] = args.cpu
+        cli_kwargs["max_cpu"] = args.cpu
     if args.strict:
         from ._seccomp import DEFAULT_ALLOW_SYSCALLS
-        policy_kwargs["allow_syscalls"] = DEFAULT_ALLOW_SYSCALLS
+        cli_kwargs["allow_syscalls"] = DEFAULT_ALLOW_SYSCALLS
     if args.privileged:
-        policy_kwargs["privileged"] = True
+        cli_kwargs["privileged"] = True
     if args.fs_isolation:
         from .policy import FsIsolation
-        policy_kwargs["fs_isolation"] = FsIsolation(args.fs_isolation)
+        cli_kwargs["fs_isolation"] = FsIsolation(args.fs_isolation)
     if args.fs_mount:
-        policy_kwargs["fs_mount"] = args.fs_mount
+        cli_kwargs["fs_mount"] = args.fs_mount
     if args.fs_storage:
-        policy_kwargs["fs_storage"] = args.fs_storage
+        cli_kwargs["fs_storage"] = args.fs_storage
     if args.max_disk:
-        policy_kwargs["max_disk"] = args.max_disk
+        cli_kwargs["max_disk"] = args.max_disk
     if args.net_bind:
-        policy_kwargs["net_bind"] = args.net_bind
+        cli_kwargs["net_bind"] = args.net_bind
     if args.net_connect:
-        policy_kwargs["net_connect"] = args.net_connect
+        cli_kwargs["net_connect"] = args.net_connect
     if args.net_allow_host:
-        policy_kwargs["net_allow_hosts"] = args.net_allow_host
+        cli_kwargs["net_allow_hosts"] = args.net_allow_host
     if args.isolate_ipc:
-        policy_kwargs["isolate_ipc"] = True
+        cli_kwargs["isolate_ipc"] = True
     if args.isolate_signals:
-        policy_kwargs["isolate_signals"] = True
+        cli_kwargs["isolate_signals"] = True
     if args.clean_env:
-        policy_kwargs["clean_env"] = True
+        cli_kwargs["clean_env"] = True
     if args.env:
         env_dict = {}
         for spec in args.env:
@@ -60,20 +61,36 @@ def cmd_run(args: argparse.Namespace) -> int:
                 return 1
             k, v = spec.split("=", 1)
             env_dict[k] = v
-        policy_kwargs["env"] = env_dict
+        cli_kwargs["env"] = env_dict
+
+    # Load profile or start from defaults, then apply CLI overrides
+    if args.profile:
+        from ._profile import load_profile, merge_cli_overrides
+        try:
+            policy = load_profile(args.profile)
+        except Exception as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if cli_kwargs:
+            policy = merge_cli_overrides(policy, cli_kwargs)
+    else:
+        policy = Policy(**cli_kwargs)
 
     # Auto-enable /proc pid isolation when /proc is readable
-    if args.readable and any(
-        p == "/proc" or p.rstrip("/") == "/proc" for p in args.readable
+    readable = list(policy.fs_readable)
+    if readable and any(
+        p == "/proc" or p.rstrip("/") == "/proc" for p in readable
     ):
         from ._notif_policy import NotifPolicy, default_proc_rules
-        if "notif_policy" not in policy_kwargs:
-            policy_kwargs["notif_policy"] = NotifPolicy(
-                rules=default_proc_rules(),
-                isolate_pids=True,
+        if policy.notif_policy is None:
+            import dataclasses
+            policy = dataclasses.replace(
+                policy,
+                notif_policy=NotifPolicy(
+                    rules=default_proc_rules(),
+                    isolate_pids=True,
+                ),
             )
-
-    policy = Policy(**policy_kwargs)
     sb = Sandbox(policy)
 
     if args.interactive:
@@ -86,6 +103,35 @@ def cmd_run(args: argparse.Namespace) -> int:
             sys.stderr.buffer.write(result.stderr)
 
     return result.exit_code
+
+
+def cmd_profile_list(args: argparse.Namespace) -> int:
+    """List available profiles."""
+    from ._profile import list_profiles, profiles_dir
+
+    names = list_profiles()
+    if not names:
+        print(f"No profiles found in {profiles_dir()}")
+        return 0
+    for name in names:
+        print(name)
+    return 0
+
+
+def cmd_profile_show(args: argparse.Namespace) -> int:
+    """Show a profile's contents."""
+    from ._profile import load_profile, profiles_dir
+    import dataclasses
+
+    path = profiles_dir() / f"{args.name}.toml"
+    if not path.is_file():
+        print(f"error: profile not found: {path}", file=sys.stderr)
+        return 1
+
+    # Show raw TOML
+    print(f"# {path}")
+    print(path.read_text(), end="")
+    return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -139,11 +185,13 @@ def main() -> None:
     run_p = sub.add_parser("run", help="Run a command in a sandbox")
     run_p.add_argument("-i", "--interactive", action="store_true",
                        help="Interactive mode: inherit stdin/stdout/stderr")
+    run_p.add_argument("-p", "--profile", metavar="NAME",
+                       help="Use a named profile from ~/.config/sandlock/profiles/")
     run_p.add_argument("command", nargs="+", help="Command to run")
     run_p.add_argument("-w", "--writable", action="append", help="Writable path")
     run_p.add_argument("-r", "--readable", action="append", help="Readable path")
     run_p.add_argument("-m", "--memory", help="Memory limit (e.g. 512M)")
-    run_p.add_argument("-p", "--processes", type=int, help="Max processes")
+    run_p.add_argument("-P", "--processes", type=int, help="Max processes")
     run_p.add_argument("-c", "--cpu", help="CPU limit (e.g. 50%%)")
     run_p.add_argument("-t", "--timeout", type=float, help="Timeout in seconds")
     run_p.add_argument("--strict", action="store_true",
@@ -173,6 +221,19 @@ def main() -> None:
     run_p.add_argument("--env", action="append", metavar="KEY=VALUE",
                        help="Set environment variable in the sandbox")
     run_p.set_defaults(func=cmd_run)
+
+    # sandlock profile
+    prof_p = sub.add_parser("profile", help="Manage profiles")
+    prof_sub = prof_p.add_subparsers(dest="profile_command")
+
+    prof_list = prof_sub.add_parser("list", help="List available profiles")
+    prof_list.set_defaults(func=cmd_profile_list)
+
+    prof_show = prof_sub.add_parser("show", help="Show a profile")
+    prof_show.add_argument("name", help="Profile name")
+    prof_show.set_defaults(func=cmd_profile_show)
+
+    prof_p.set_defaults(func=lambda args: (prof_p.print_help(), 1)[1])
 
     # sandlock check
     check_p = sub.add_parser("check", help="Check kernel support")

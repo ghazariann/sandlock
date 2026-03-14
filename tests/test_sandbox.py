@@ -28,6 +28,16 @@ class TestSandboxInit:
     def test_not_alive_initially(self):
         sb = Sandbox(Policy())
         assert not sb.alive
+
+    def test_from_profile_name(self, tmp_path, monkeypatch):
+        import sandlock._profile as mod
+        monkeypatch.setattr(mod, "_PROFILES_DIR", tmp_path)
+        (tmp_path / "test.toml").write_text(
+            'max_memory = "256M"\nclean_env = true\n'
+        )
+        sb = Sandbox("test")
+        assert sb.policy.max_memory == "256M"
+        assert sb.policy.clean_env is True
         assert sb.pid is None
 
 

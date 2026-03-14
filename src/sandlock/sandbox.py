@@ -42,7 +42,10 @@ class Sandbox:
             sb.resume()
     """
 
-    def __init__(self, policy: Policy, *, sandbox_id: str | None = None):
+    def __init__(self, policy: Policy | str, *, sandbox_id: str | None = None):
+        if isinstance(policy, str):
+            from ._profile import load_profile
+            policy = load_profile(policy)
         self._policy = policy
         self._id = sandbox_id or uuid.uuid4().hex[:12]
         self._ctx: SandboxContext | None = None

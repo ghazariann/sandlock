@@ -45,6 +45,7 @@ Optional kernel versions for additional features:
 | NOTIF_ADDFD (virtualization) | 5.9 |
 | Landlock filesystem rules | 5.13 |
 | Landlock TCP port rules | 6.7 (ABI v4) |
+| Landlock IPC scoping | 6.12 (ABI v6) |
 
 Check your system:
 
@@ -64,7 +65,7 @@ python3 cli/sandlock.py run -r /usr -r /lib -w /tmp -- ls /tmp
 python3 cli/sandlock.py run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
 
 # With resource limits
-python3 cli/sandlock.py run -m 512M -p 20 -t 30 -- ./compute.sh
+python3 cli/sandlock.py run -m 512M -P 20 -t 30 -- ./compute.sh
 
 # Network: only allow connecting to specific domains
 python3 cli/sandlock.py run \
@@ -78,9 +79,50 @@ python3 cli/sandlock.py run --net-bind 8080 --net-connect 443 \
   -r /usr -r /lib -r /lib64 -r /etc \
   -- python3 server.py
 
+# IPC scoping: block abstract UNIX sockets and signals to host
+sandlock run --isolate-ipc --isolate-signals \
+  -r /usr -r /lib -r /lib64 -r /etc \
+  -- python3 untrusted.py
+
+# Clean environment: strip all env vars except essentials
+sandlock run --clean-env --env CC=gcc --env LANG=C.UTF-8 \
+  -r /usr -r /lib -w /tmp -- make
+
+# Use a saved profile
+sandlock run -p build -- make -j4
+
+# Override profile values from CLI
+sandlock run -p build --max-memory 1G -w /home/user/src -- make
+
+# Manage profiles
+sandlock profile list
+sandlock profile show build
+
 # Check kernel support
-python3 cli/sandlock.py check
+sandlock check
 ```
+
+### Profiles
+
+Save reusable sandbox configurations as TOML files in
+`~/.config/sandlock/profiles/`:
+
+```toml
+# ~/.config/sandlock/profiles/build.toml
+fs_writable = ["/tmp/work"]
+fs_readable = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+clean_env = true
+isolate_ipc = true
+max_memory = "512M"
+max_processes = 50
+
+[env]
+CC = "gcc"
+LANG = "C.UTF-8"
+```
+
+Field names match `Policy` exactly. Unknown fields are rejected (catches typos).
+CLI flags override profile values.
 
 ### Python API
 
@@ -93,11 +135,18 @@ policy = Policy(
     fs_readable=["/usr", "/lib", "/etc"],
     max_memory="256M",
     max_processes=10,
+    isolate_ipc=True,        # Block abstract UNIX sockets to host
+    isolate_signals=True,    # Block signals to host processes
+    clean_env=True,          # Minimal environment
+    env={"LANG": "C.UTF-8"}, # Inject specific vars
 )
 
 result = Sandbox(policy).run(["python3", "-c", "print('hello')"])
 print(result.stdout)  # b'hello\n'
 print(result.exit_code)  # 0
+
+# Or use a saved TOML profile
+result = Sandbox("build").run(["make", "-j4"])
 ```
 
 ### Run a Python function
@@ -165,7 +214,8 @@ Parent                              Child
   │                                   │     notif + deny + resource tracking
   │                                   │     └─ send notify fd ──────> Parent
   │  receive notify fd                ├─ 7. Close fds 3+
-  │  start supervisor thread          └─ 8. exec(cmd) or target()
+  │  start supervisor thread          ├─ 8. Environment (clean_env + env overrides)
+  │                                   └─ 9. exec(cmd) or target()
   │                                   │
   │  pidfd_open()                     │
   │  poll() for exit                  │
@@ -199,6 +249,20 @@ Policy(
 ```
 
 Port specs accept integers or `"lo-hi"` range strings. Empty = unrestricted.
+
+**IPC Scoping** (ABI v6+, Linux 6.12+):
+
+```python
+Policy(
+    isolate_ipc=True,       # Block abstract UNIX sockets outside sandbox
+    isolate_signals=True,   # Block signals to processes outside sandbox
+)
+```
+
+IPC scoping prevents sandboxed processes from communicating with host
+services via abstract UNIX sockets (e.g., D-Bus, X11) or sending signals
+to host processes. These are domain-wide restrictions with no per-rule
+exceptions.
 
 Landlock rules are applied via `landlock_restrict_self()` and are
 **irreversible**. The child cannot remove them.
@@ -511,7 +575,10 @@ class Policy:
 
     # Network — domain allowlist (seccomp notif)
     net_allow_hosts: Sequence[str] = []  # Allowed domains; empty = unrestricted
-    # Resolved before fork → virtual /etc/hosts + IP enforcement on connect/sendto
+
+    # IPC scoping (Landlock ABI v6+, Linux 6.12+)
+    isolate_ipc: bool = False       # Block abstract UNIX sockets outside sandbox
+    isolate_signals: bool = False   # Block signals to processes outside sandbox
 
     # Network — TCP port rules (Landlock ABI v4+)
     net_bind: Sequence[int | str] = []      # Allowed bind ports; empty = unrestricted
@@ -521,6 +588,10 @@ class Policy:
     max_memory: str | int | None = None  # '512M' — per-sandbox mmap budget
     max_processes: int | None = None      # per-sandbox fork count
     max_cpu: str | None = None           # '50%' — per-process RLIMIT_CPU
+
+    # Environment
+    clean_env: bool = False              # Start with minimal env (PATH, HOME, etc.)
+    env: Mapping[str, str] = {}          # Set/override env vars in child
 
     # BranchFS COW isolation
     fs_isolation: FsIsolation = FsIsolation.NONE   # NONE | BRANCHFS
