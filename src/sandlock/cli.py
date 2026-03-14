@@ -29,6 +29,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.strict:
         from ._seccomp import DEFAULT_ALLOW_SYSCALLS
         cli_kwargs["allow_syscalls"] = DEFAULT_ALLOW_SYSCALLS
+    if args.image:
+        from ._image import extract
+        try:
+            rootfs = extract(args.image)
+        except Exception as e:
+            print(f"error: failed to pull image {args.image!r}: {e}",
+                  file=sys.stderr)
+            return 1
+        cli_kwargs["chroot"] = rootfs
+        cli_kwargs["privileged"] = True
+        if not args.readable:
+            cli_kwargs.setdefault("fs_readable", ["/"])
+        if not args.writable:
+            cli_kwargs.setdefault("fs_writable", ["/tmp"])
     if args.chroot:
         cli_kwargs["chroot"] = args.chroot
     if args.privileged:
@@ -78,12 +92,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         policy = Policy(**cli_kwargs)
 
+    # Resolve command: explicit args, or image default, or error
+    command = args.command
+    if not command:
+        if args.image:
+            from ._image import get_default_cmd
+            command = get_default_cmd(args.image)
+        else:
+            print("error: no command specified", file=sys.stderr)
+            return 1
+
     sb = Sandbox(policy)
 
     if args.interactive:
-        result = sb.run_interactive(args.command, timeout=args.timeout)
+        result = sb.run_interactive(command, timeout=args.timeout)
     else:
-        result = sb.run(args.command, timeout=args.timeout)
+        result = sb.run(command, timeout=args.timeout)
         if result.stdout:
             sys.stdout.buffer.write(result.stdout)
         if result.stderr:
@@ -174,7 +198,7 @@ def main() -> None:
                        help="Interactive mode: inherit stdin/stdout/stderr")
     run_p.add_argument("-p", "--profile", metavar="NAME",
                        help="Use a named profile from ~/.config/sandlock/profiles/")
-    run_p.add_argument("command", nargs="+", help="Command to run")
+    run_p.add_argument("command", nargs="*", help="Command to run")
     run_p.add_argument("-w", "--writable", action="append", help="Writable path")
     run_p.add_argument("-r", "--readable", action="append", help="Readable path")
     run_p.add_argument("-m", "--memory", help="Memory limit (e.g. 512M)")
@@ -183,6 +207,8 @@ def main() -> None:
     run_p.add_argument("-t", "--timeout", type=float, help="Timeout in seconds")
     run_p.add_argument("--strict", action="store_true",
                        help="Allowlist mode: only permit known-safe syscalls")
+    run_p.add_argument("--image", metavar="IMAGE",
+                       help="Use a Docker/OCI image as root filesystem (e.g. python:3.12-slim)")
     run_p.add_argument("--chroot", metavar="PATH",
                        help="Use directory as root filesystem (requires --privileged)")
     run_p.add_argument("--privileged", action="store_true",
