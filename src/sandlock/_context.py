@@ -152,6 +152,11 @@ class SandboxContext:
         - write uid/gid maps             — if privileged mode
         - receive notify fd              — start seccomp supervisor thread
         - start throttle thread           — if max_cpu is set
+
+    Nesting: Landlock and seccomp BPF filters stack naturally (kernel
+    ANDs them).  The seccomp notif supervisor and resource limits
+    (max_processes, max_memory) apply only at the outermost level.
+    CPU throttle works at each level (separate process groups).
     """
 
     def __init__(
@@ -362,6 +367,7 @@ class SandboxContext:
             self._control_fd = -1
 
     def __enter__(self) -> "SandboxContext":
+        global _confined
         # Auto-enable /proc PID isolation when /proc is readable
         self._notif_policy = self._policy.notif_policy
         has_proc = any(
@@ -410,8 +416,9 @@ class SandboxContext:
         _libc.prctl(ctypes.c_int(36), ctypes.c_ulong(1),  # PR_SET_CHILD_SUBREAPER
                      ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0))
 
-        # Create socket pair for passing the notify fd from child to parent
-        if use_notif:
+        # Create socket pair for passing the notify fd from child to parent.
+        # Skip in nested sandboxes — notif filter can't be stacked.
+        if use_notif and not _confined:
             parent_sock, child_sock = socket.socketpair(
                 socket.AF_UNIX, socket.SOCK_STREAM,
             )
@@ -437,7 +444,6 @@ class SandboxContext:
 
         if pid == 0:
             # === Child process ===
-            global _confined
             ctrl_parent.close()
             if parent_sock is not None:
                 parent_sock.close()
@@ -529,32 +535,25 @@ class SandboxContext:
                     else None
                 )
 
-                if use_notif and child_sock is not None:
-                    if _confined:
-                        # Nested sandbox: parent's supervisor already
-                        # intercepts our syscalls.  Skip notif filter.
-                        child_sock.close()
-                    else:
-                        try:
-                            from ._landlock import _set_no_new_privs
-                            _set_no_new_privs()
-                            notify_fd = install_notif_filter(
-                                _notif_syscall_names(self._notif_policy),
-                                deny_syscalls=deny,
-                                allow_syscalls=allow,
+                if use_notif and child_sock is not None and not _confined:
+                    # First-level sandbox: install combined notif + BPF filter
+                    try:
+                        from ._landlock import _set_no_new_privs
+                        _set_no_new_privs()
+                        notify_fd = install_notif_filter(
+                            _notif_syscall_names(self._notif_policy),
+                            deny_syscalls=deny,
+                            allow_syscalls=allow,
+                        )
+                        send_fd(child_sock, notify_fd)
+                        os.close(notify_fd)
+                    except Exception as e:
+                        if self._policy.strict:
+                            raise ConfinementError(
+                                f"seccomp notif filter failed: {e}"
                             )
-                            send_fd(child_sock, notify_fd)
-                            os.close(notify_fd)
-                        except Exception as e:
-                            if self._policy.strict:
-                                raise ConfinementError(
-                                    f"seccomp notif filter failed: {e}"
-                                )
-                        finally:
-                            child_sock.close()
-                    # Combined filter handles deny — install allowlist
-                    # separately only if in allowlist mode (the combined
-                    # filter can't enumerate all syscalls to deny).
+                    finally:
+                        child_sock.close()
                     if allow is not None:
                         try:
                             apply_seccomp_filter(allow_syscalls=allow)
@@ -564,6 +563,11 @@ class SandboxContext:
                                     "seccomp allowlist filter failed"
                                 )
                 else:
+                    # Nested sandbox or no notif: stack a BPF deny/allow
+                    # filter.  BPF filters are ANDed by the kernel, so
+                    # each nesting level can only tighten.
+                    if child_sock is not None:
+                        child_sock.close()
                     try:
                         apply_seccomp_filter(deny, allow)
                     except Exception:
