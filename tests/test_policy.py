@@ -55,7 +55,7 @@ class TestPolicy:
         assert p.net_connect == []
         assert p.max_memory is None
         assert p.max_processes is None
-        assert p.cpu_time is None
+        assert p.max_cpu is None
         assert p.close_fds is True
 
     def test_frozen(self):
@@ -75,21 +75,17 @@ class TestPolicy:
         p = Policy()
         assert p.memory_bytes() is None
 
-    def test_cpu_time_duration(self):
-        p = Policy(cpu_time="5m")
-        assert p.cpu_time_secs() == 300
+    def test_cpu_pct(self):
+        p = Policy(max_cpu=50)
+        assert p.cpu_pct() == 50
 
-    def test_cpu_time_none(self):
+    def test_cpu_pct_none(self):
         p = Policy()
-        assert p.cpu_time_secs() is None
+        assert p.cpu_pct() is None
 
-    def test_cpu_time_int(self):
-        p = Policy(cpu_time=60)
-        assert p.cpu_time_secs() == 60
-
-    def test_cpu_time_minimum_1s(self):
-        p = Policy(cpu_time=0)
-        assert p.cpu_time_secs() == 1
+    def test_cpu_pct_clamped(self):
+        assert Policy(max_cpu=0).cpu_pct() == 1
+        assert Policy(max_cpu=200).cpu_pct() == 100
 
 
 class TestParsePorts:

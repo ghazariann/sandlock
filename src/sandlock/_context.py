@@ -133,7 +133,7 @@ class SandboxContext:
 
     The child confinement sequence:
         1. setpgid(0, 0)                  — new process group
-        2. Apply resource limits            — RLIMIT_CPU, seccomp notif
+        2. Apply resource limits            — seccomp notif
         3. chroot(path) if policy.chroot   — optional path illusion
         4. confine(writable, readable)     — Landlock (irreversible)
         5. install notif filter + send fd  — seccomp user notification (optional)
@@ -157,6 +157,8 @@ class SandboxContext:
         self._pid: Optional[int] = None
         self._pidfd: int = -1
         self._supervisor = None  # NotifSupervisor | None (lazy import)
+        self._throttle_stop = None  # threading.Event | None
+        self._throttle_thread = None  # threading.Thread | None
         self._control_fd: int = -1  # Parent's end of control socket
         self._exited = False
 
@@ -234,7 +236,10 @@ class SandboxContext:
         if self._supervisor is not None:
             tracked = self._supervisor.tracked_pids
 
-        # Stop supervisor first — it reads from child memory
+        # Stop throttle first — ensure child is resumed for clean exit
+        self._stop_throttle()
+
+        # Stop supervisor — it reads from child memory
         self._stop_supervisor()
 
         # SIGTERM the process group
@@ -270,6 +275,50 @@ class SandboxContext:
         if self._supervisor is not None:
             self._supervisor.stop()
             self._supervisor = None
+
+    def _start_throttle(self, pgid: int, pct: int) -> None:
+        """Start a daemon thread that throttles CPU via SIGSTOP/SIGCONT."""
+        import threading
+        import time
+
+        period = 0.1  # 100ms cycle
+        run_time = period * pct / 100
+        stop_time = period - run_time
+        stop_event = threading.Event()
+        self._throttle_stop = stop_event
+
+        def _loop():
+            while not stop_event.is_set():
+                if stop_event.wait(run_time):
+                    break
+                try:
+                    os.killpg(pgid, signal.SIGSTOP)
+                except ProcessLookupError:
+                    break
+                if stop_event.wait(stop_time):
+                    # Ensure we resume before exiting
+                    try:
+                        os.killpg(pgid, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+                    break
+                try:
+                    os.killpg(pgid, signal.SIGCONT)
+                except ProcessLookupError:
+                    break
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        self._throttle_thread = t
+
+    def _stop_throttle(self) -> None:
+        """Stop the throttle thread and ensure the child is resumed."""
+        if self._throttle_stop is not None:
+            self._throttle_stop.set()
+        if self._throttle_thread is not None:
+            self._throttle_thread.join(timeout=1.0)
+            self._throttle_thread = None
+            self._throttle_stop = None
 
     def _reap(self) -> None:
         """Reap the child process (non-blocking, best-effort)."""
@@ -393,15 +442,7 @@ class SandboxContext:
                                 "User namespace unavailable and policy.privileged=True"
                             )
 
-                # 2. Apply per-process CPU time limit via RLIMIT_CPU
-                cpu_secs = self._policy.cpu_time_secs()
-                if cpu_secs is not None:
-                    import resource
-                    resource.setrlimit(
-                        resource.RLIMIT_CPU, (cpu_secs, cpu_secs),
-                    )
-
-                # 3. chroot if requested
+                # 2. chroot if requested
                 if self._policy.chroot:
                     setup_chroot(self._policy.chroot)
 
@@ -567,6 +608,11 @@ class SandboxContext:
                         parent_sock.close()
                     except OSError:
                         pass
+
+            # Start CPU throttle thread if max_cpu is set
+            cpu_pct = self._policy.cpu_pct()
+            if cpu_pct is not None and cpu_pct < 100:
+                self._start_throttle(pid, cpu_pct)
 
             return self
 

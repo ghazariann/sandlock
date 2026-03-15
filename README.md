@@ -23,7 +23,7 @@ confinement without image builds, overlay filesystems, or root privileges.
 | Filesystem isolation | Landlock | Overlay | Block-level (QCOW2) | ptrace/KVM |
 | Network isolation | Landlock + seccomp notif | Network namespace | TAP device | Sentry kernel |
 | Syscall filtering | seccomp-bpf | seccomp | N/A (full kernel) | Sentry kernel |
-| Resource limits | seccomp notif + rlimit | cgroup v2 | VM config | cgroup v2 |
+| Resource limits | seccomp notif + SIGSTOP/SIGCONT | cgroup v2 | VM config | cgroup v2 |
 | Memory sharing | COW (fork), zero-copy | Bind-mount + re-init | Shared mem (explicit) | N/A |
 | Nesting | Native (fork) | Complex (DinD/DooD) | Not supported | Supported |
 | Checkpoint/restore | ptrace + BranchFS | CRIU | VM snapshot | N/A |
@@ -146,10 +146,9 @@ Parent                              Child
   │──────────────────────────────────>│
   │                                   ├─ 1. setpgid(0,0)
   │                                   ├─ 2. unshare(NEWUSER) (if privileged)
-  │                                   ├─ 3. RLIMIT_CPU (if cpu_time)
-  │                                   ├─ 4. chroot (optional)
-  │                                   ├─ 5. Landlock (fs + net + IPC, irreversible)
-  │                                   ├─ 6. Combined seccomp filter (irreversible)
+  │                                   ├─ 3. chroot (optional)
+  │                                   ├─ 4. Landlock (fs + net + IPC, irreversible)
+  │                                   ├─ 5. Combined seccomp filter (irreversible)
   │                                   │     └─ send notify fd ──────> Parent
   │  receive notify fd                ├─ 7. Close fds 3+
   │  start supervisor thread          ├─ 8. Environment (clean_env + env)
@@ -184,13 +183,18 @@ in `clone`/`clone3` and `TIOCSTI` in `ioctl`. Supports **x86_64** and **aarch64*
 
 ### Resource Limits
 
-Enforced via **seccomp user notification** and **rlimit** — no cgroups or root required.
+Enforced via **seccomp user notification** and **SIGSTOP/SIGCONT**, no cgroups or root required.
 
 | Resource | Mechanism | Enforcement |
 |---|---|---|
 | Memory | seccomp notif on `mmap`/`munmap`/`brk`/`mremap` | `ENOMEM` when over budget |
 | Processes | seccomp notif on `clone`/`fork`/`vfork` | `EAGAIN` when at limit |
-| CPU | `RLIMIT_CPU` per-process | `SIGXCPU` → `SIGKILL` |
+| CPU | Parent-side SIGSTOP/SIGCONT on process group | Throttle to N% of one core |
+
+CPU throttling works like cgroup v2 `cpu.max` but without root: a supervisor
+thread cycles SIGSTOP/SIGCONT on the sandbox process group every 100ms.
+`max_cpu=50` means ~50ms running, ~50ms stopped per cycle, roughly 50% of
+one core.  Applies collectively to all processes in the sandbox.
 
 ### Network: Domain-Based Access Control
 
@@ -277,10 +281,10 @@ class Policy:
     isolate_ipc: bool = False       # Block abstract UNIX sockets to host
     isolate_signals: bool = False   # Block signals to host processes
 
-    # Resources (seccomp notif + rlimit)
+    # Resources (seccomp notif + SIGSTOP/SIGCONT)
     max_memory: str | int | None = None  # '512M'
     max_processes: int | None = None     # per-sandbox fork count
-    cpu_time: str | int | None = None    # '30s' per-process RLIMIT_CPU
+    max_cpu: int | None = None            # 50 = 50% of one core (SIGSTOP/SIGCONT)
 
     # Environment
     clean_env: bool = False              # Minimal env (PATH, HOME, TERM, LANG, USER, SHELL)

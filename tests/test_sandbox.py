@@ -126,3 +126,45 @@ class TestSandboxNested:
         inner = sb.sandbox(Policy(max_memory="256M"))
         assert isinstance(inner, Sandbox)
         assert inner.policy.max_memory == "256M"
+
+
+class TestCpuThrottle:
+    """Test SIGSTOP/SIGCONT CPU throttling."""
+
+    @staticmethod
+    def _burn_cpu():
+        """Fixed CPU workload (not wall-clock dependent)."""
+        total = 0
+        for _ in range(20_000_000):
+            total += 1
+        return total
+
+    def test_throttle_slows_execution(self):
+        """50% throttle should take roughly 2x wall time."""
+        import time
+
+        # Baseline without throttle
+        t0 = time.monotonic()
+        Sandbox(Policy()).call(self._burn_cpu)
+        base = time.monotonic() - t0
+
+        # 50% throttle
+        t0 = time.monotonic()
+        result = Sandbox(Policy(max_cpu=50)).call(self._burn_cpu)
+        throttled = time.monotonic() - t0
+
+        assert result.success
+        ratio = throttled / base
+        # Allow generous range: 1.5x–3.0x (signal jitter, CI variance)
+        assert 1.5 <= ratio <= 3.0, f"ratio={ratio:.1f}, expected ~2.0"
+
+    def test_throttle_100_is_noop(self):
+        """max_cpu=100 should not start a throttle thread."""
+        result = Sandbox(Policy(max_cpu=100)).call(self._burn_cpu)
+        assert result.success
+
+    def test_throttle_result_correct(self):
+        """Throttled process should still return correct results."""
+        result = Sandbox(Policy(max_cpu=50)).call(self._burn_cpu)
+        assert result.success
+        assert result.value == 20_000_000

@@ -40,7 +40,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     # Resources
     "max_memory": str,
     "max_processes": int,
-    "cpu_time": str,
+    "max_cpu": int,
     # Chroot
     "chroot": str,
     # Environment

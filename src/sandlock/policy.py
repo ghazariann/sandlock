@@ -50,37 +50,6 @@ def parse_memory_size(s: str) -> int:
     return int(value)
 
 
-_DURATION_UNITS = {
-    "s": 1,
-    "m": 60,
-    "h": 3600,
-}
-
-_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh])?\s*$")
-
-
-def parse_duration(s: str) -> int:
-    """Parse a human-friendly duration string to seconds.
-
-    Accepts plain integers (seconds) or suffixed values: ``'30s'``, ``'5m'``,
-    ``'1h'``.  Returns whole seconds (rounded up).
-
-    Raises:
-        ValueError: If the string cannot be parsed.
-    """
-    m = _DURATION_RE.match(s)
-    if m is None:
-        raise ValueError(f"invalid duration: {s!r}")
-    value = float(m.group(1))
-    suffix = m.group(2)
-    if suffix is not None:
-        value *= _DURATION_UNITS[suffix]
-    result = int(value)
-    if value > result:
-        result += 1  # round up
-    return result
-
-
 _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 
 
@@ -179,11 +148,11 @@ class Policy:
     """Maximum total forks allowed in the sandbox (lifetime count,
     not concurrent).  Enforced by the seccomp notif supervisor."""
 
-    cpu_time: str | int | None = None
-    """Per-process CPU time limit.  String like ``'30s'``, ``'5m'``,
-    ``'1h'`` or int seconds.  Sets RLIMIT_CPU on the sandbox process
-    (inherited by children via fork).  Each process gets its own
-    counter, so worst-case total CPU is ``cpu_time * max_processes``."""
+    max_cpu: int | None = None
+    """CPU throttle as a percentage of one core (1–100).  E.g. ``50``
+    means the sandbox process group gets at most 50% of one core.
+    Enforced by the parent via SIGSTOP/SIGCONT cycling on the process
+    group — applies to all processes in the sandbox collectively."""
 
     # Optional chroot
     chroot: str | None = None
@@ -256,10 +225,8 @@ class Policy:
             return self.max_memory
         return parse_memory_size(self.max_memory)
 
-    def cpu_time_secs(self) -> int | None:
-        """Return cpu_time as whole seconds, or None if unset."""
-        if self.cpu_time is None:
+    def cpu_pct(self) -> int | None:
+        """Return max_cpu as a clamped percentage (1–100), or None."""
+        if self.max_cpu is None:
             return None
-        if isinstance(self.cpu_time, int):
-            return max(1, self.cpu_time)
-        return max(1, parse_duration(self.cpu_time))
+        return max(1, min(100, self.max_cpu))
