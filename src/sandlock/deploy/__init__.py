@@ -17,4 +17,4 @@ except ImportError:
 from ._remote import deploy, verify
 from ._sandbox import RemoteSandbox
 from ._target import Target, Cluster, load_target, load_targets, load_cluster
-from ._scheduler import schedule, probe_cluster, NodeStatus
+from ._scheduler import schedule, probe_cluster, probe_cluster_cached, NodeStatus
