@@ -650,11 +650,20 @@ class NotifSupervisor:
         if not self._id_valid(notif.id):
             return
 
-        # Virtualize /proc/net/tcp{,6} to hide other sandboxes' ports
+        # Virtualize /proc/net/* to hide host and other sandboxes' info
         if self._port_map is not None and (
             path.endswith("/net/tcp") or path.endswith("/net/tcp6")
         ):
             content = self._filter_proc_net_tcp(path)
+            self._respond_virtualize(notif.id, content)
+            return
+
+        _NET_HIDE = ("/net/unix", "/net/udp", "/net/udp6",
+                     "/net/raw", "/net/raw6")
+        if self._port_map is not None and any(
+            path.endswith(suffix) for suffix in _NET_HIDE
+        ):
+            content = self._filter_proc_net_header_only(path)
             self._respond_virtualize(notif.id, content)
             return
 
@@ -876,6 +885,15 @@ class NotifSupervisor:
                 continue
 
         return "".join(result).encode()
+
+    def _filter_proc_net_header_only(self, path: str) -> bytes:
+        """Return only the header line from a /proc/net/* file."""
+        canonical = path.replace("/proc/net/", "/proc/self/net/")
+        try:
+            with open(canonical) as f:
+                return f.readline().encode()
+        except OSError:
+            return b""
 
     def _handle_getsockname(self, notif: SeccompNotif) -> None:
         """Handle getsockname — do it in supervisor and rewrite real port to virtual.
