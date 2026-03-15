@@ -491,6 +491,99 @@ class TestNamedCheckpoints(unittest.TestCase):
         self.assertEqual(names, ["real"])
 
 
+class TestEndToEndCheckpoint(unittest.TestCase):
+    """End-to-end checkpoint: start sandbox, checkpoint, restore, verify."""
+
+    def _ptrace_allowed(self):
+        """Check if ptrace is permitted (Yama scope 0 or CAP_SYS_PTRACE)."""
+        try:
+            val = open("/proc/sys/kernel/yama/ptrace_scope").read().strip()
+            return val == "0"
+        except FileNotFoundError:
+            return True
+
+    def test_app_state_roundtrip(self):
+        """Checkpoint captures app state and restore receives it."""
+        import tempfile
+        import time
+        from sandlock.sandbox import Sandbox
+
+        if not self._ptrace_allowed():
+            self.skipTest("ptrace not permitted (yama ptrace_scope != 0)")
+
+        store = Path(tempfile.mkdtemp(prefix="sandlock_e2e_ckpt_"))
+
+        try:
+            policy = Policy()
+
+            def save_fn():
+                return b"counter=42"
+
+            with Sandbox(policy) as sb:
+                sb.exec(["sleep", "60"], save_fn=save_fn)
+                time.sleep(0.2)
+
+                cp = sb.checkpoint()
+                self.assertIsNotNone(cp.app_state)
+                self.assertEqual(cp.app_state, b"counter=42")
+                self.assertIsNotNone(cp.process_state)
+
+                cp.save("e2e", store=store)
+                loaded = Checkpoint.load("e2e", store=store)
+                self.assertEqual(loaded.app_state, b"counter=42")
+
+            received = {}
+
+            def restore_fn(state):
+                received["state"] = state
+
+            result = Sandbox.from_checkpoint(
+                loaded, restore_fn, timeout=5,
+            )
+            self.assertTrue(result.success)
+            self.assertEqual(received["state"], b"counter=42")
+        finally:
+            import shutil
+            shutil.rmtree(store, ignore_errors=True)
+
+    def test_app_state_via_call(self):
+        """Checkpoint save/load/restore roundtrip using call() API."""
+        import tempfile
+        from sandlock.sandbox import Sandbox
+
+        store = Path(tempfile.mkdtemp(prefix="sandlock_e2e_call_"))
+
+        try:
+            # Manually build a checkpoint with app state (no ptrace needed)
+            policy = Policy(max_memory="256M")
+            cp = Checkpoint(
+                app_state=b"state:hello",
+                policy_data=pickle.dumps(policy),
+                sandbox_id="e2e-call",
+            )
+
+            cp.save("call-test", store=store)
+            loaded = Checkpoint.load("call-test", store=store)
+            self.assertEqual(loaded.app_state, b"state:hello")
+
+            # restore_fn runs in a forked child; assert inside it
+            # so a mismatch causes the child to exit non-zero
+            def restore_fn(state):
+                assert state == b"state:hello", f"got {state!r}"
+
+            result = Sandbox.from_checkpoint(
+                loaded, restore_fn, timeout=5,
+            )
+            self.assertTrue(result.success, f"restore failed: {result.error}")
+
+            # Verify restored policy
+            restored_policy = pickle.loads(loaded.policy_data)
+            self.assertEqual(restored_policy.max_memory, "256M")
+        finally:
+            import shutil
+            shutil.rmtree(store, ignore_errors=True)
+
+
 class TestExports(unittest.TestCase):
     def test_checkpoint_importable(self):
         from sandlock import Checkpoint
