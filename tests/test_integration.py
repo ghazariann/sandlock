@@ -708,29 +708,15 @@ except (PermissionError, FileNotFoundError, OSError):
         result = Sandbox(policy).run(
             ["python3", "-c", """
 import os
-# List /proc and collect numeric (PID) entries
 pids = [e for e in os.listdir('/proc') if e.isdigit()]
 my_pid = str(os.getpid())
-# Our own PID should be visible
-if my_pid in pids:
-    print(f'SELF_VISIBLE')
-else:
-    print(f'SELF_HIDDEN')
-# PID 1 (init) should NOT be visible
-if '1' in pids:
-    print('INIT_VISIBLE')
-else:
-    print('INIT_HIDDEN')
-print(f'PID_COUNT={len(pids)}')
+assert my_pid in pids, 'own PID not visible'
+assert '1' not in pids, 'PID 1 should be hidden'
+assert len(pids) < 10, f'too many PIDs visible: {len(pids)}'
+print('OK')
 """]
         )
         assert result.success
-        assert b"INIT_HIDDEN" in result.stdout
-        # Should have very few PIDs (just the sandbox's own)
-        for line in result.stdout.decode().splitlines():
-            if line.startswith("PID_COUNT="):
-                count = int(line.split("=")[1])
-                assert count < 10, f"Too many PIDs visible: {count}"
 
     def test_always_isolates_when_proc_readable(self):
         """PID isolation is always on when /proc is in fs_readable."""
@@ -741,15 +727,11 @@ print(f'PID_COUNT={len(pids)}')
             ["python3", "-c", """
 import os
 pids = [e for e in os.listdir('/proc') if e.isdigit()]
-if '1' in pids:
-    print('INIT_VISIBLE')
-else:
-    print('INIT_HIDDEN')
-print(f'PID_COUNT={len(pids)}')
+assert '1' not in pids, 'PID 1 should be hidden'
+print('OK')
 """]
         )
         assert result.success
-        assert b"INIT_HIDDEN" in result.stdout
 
 
 # --- Resource limits (seccomp notif based) ---
