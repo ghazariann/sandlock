@@ -190,6 +190,7 @@ def default_proc_rules() -> tuple[PathRule, ...]:
         PathRule("/proc/key-users", NotifAction.DENY, errno.EACCES),
         PathRule("/proc/sched_debug", NotifAction.DENY, errno.EACCES),
         PathRule("/proc/timer_list", NotifAction.DENY, errno.EACCES),
+        PathRule("/proc/modules", NotifAction.DENY, errno.EACCES),
         # Deny sensitive sysfs paths
         PathRule("/sys/kernel/", NotifAction.DENY, errno.EACCES),
         PathRule("/sys/firmware/", NotifAction.DENY, errno.EACCES),
