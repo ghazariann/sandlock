@@ -595,12 +595,17 @@ class NotifSupervisor:
             self._handle_fork(notif, nr)
             return
 
-        # --- Port remapping: bind / connect ---
+        # --- Port remapping: bind / connect / getsockname ---
         nr_bind = _SYSCALL_NR.get("bind")
         nr_connect = _SYSCALL_NR.get("connect")
+        nr_getsockname = _SYSCALL_NR.get("getsockname")
 
         if self._port_map is not None and nr in (nr_bind, nr_connect):
             self._handle_port_remap(notif, nr)
+            return
+
+        if self._port_map is not None and nr == nr_getsockname:
+            self._handle_getsockname(notif)
             return
 
         # --- Network: connect / sendto / sendmsg IP enforcement ---
@@ -807,6 +812,31 @@ class NotifSupervisor:
         except OSError:
             pass  # Can't read/write child memory — let syscall proceed as-is
 
+        self._respond_continue(notif.id)
+
+    def _handle_getsockname(self, notif: SeccompNotif) -> None:
+        """Handle getsockname — do it in supervisor and rewrite real port to virtual.
+
+        Can't use CONTINUE because getsockname fills the sockaddr after
+        the syscall completes.  Instead, we do the call in supervisor
+        space via pidfd_getfd, rewrite the port, and return the result.
+        """
+        from ._port_remap import fixup_getsockname
+
+        # getsockname(fd, addr, addrlen_ptr)
+        fd = notif.data.args[0] & 0xFFFFFFFF
+        sockaddr_addr = notif.data.args[1]
+        addrlen_addr = notif.data.args[2]
+
+        try:
+            if fixup_getsockname(notif.pid, sockaddr_addr, addrlen_addr,
+                                 fd, self._port_map):
+                self._respond_val(notif.id, 0)  # Success
+                return
+        except OSError:
+            pass
+
+        # Fallback: let the syscall proceed normally
         self._respond_continue(notif.id)
 
     def _handle_getdents(self, notif: SeccompNotif) -> None:

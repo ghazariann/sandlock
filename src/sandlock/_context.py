@@ -99,7 +99,7 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
     if notif is not None and notif.allowed_ips:
         names.extend(["connect", "sendto"])
     if notif is not None and notif.port_remap:
-        names.extend(["bind", "connect"])
+        names.extend(["bind", "connect", "getsockname"])
     if notif is not None and notif.max_memory_bytes > 0:
         names.extend(["mmap", "munmap", "brk", "mremap"])
     if notif is not None and notif.max_processes > 0:

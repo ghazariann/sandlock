@@ -17,9 +17,16 @@ write access).
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import struct
 import threading
 from dataclasses import dataclass, field
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+# pidfd_getfd(2) syscall number
+_NR_PIDFD_GETFD = 438  # x86_64 and aarch64 (asm-generic)
 
 _AF_INET = 2
 _AF_INET6 = 10
@@ -141,4 +148,87 @@ def _remap_sockaddr(pid: int, sockaddr_addr: int, addrlen: int,
         return False  # Already a real port, no rewrite needed
 
     write_bytes(pid, sockaddr_addr + _PORT_OFFSET, struct.pack("!H", real))
+    return True
+
+
+def fixup_getsockname(pid: int, sockaddr_addr: int, addrlen_addr: int,
+                      fd: int, port_map: PortMap) -> bool:
+    """Perform getsockname() in the supervisor and rewrite real port to virtual.
+
+    We can't use CONTINUE because getsockname() fills the sockaddr
+    after the syscall, and we need to post-process it.  Instead, we
+    duplicate the child's socket via pidfd_getfd, do getsockname()
+    in supervisor space, rewrite real->virtual port, and write the
+    result into the child's memory.
+
+    Returns True if handled, False if not applicable.
+    """
+    import os
+    import socket as sock_mod
+    from ._procfs import write_bytes
+
+    # Duplicate the child's socket fd via pidfd_getfd syscall
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError:
+        return False
+
+    try:
+        local_fd = _libc.syscall(
+            ctypes.c_long(_NR_PIDFD_GETFD),
+            ctypes.c_int(pidfd),
+            ctypes.c_int(fd),
+            ctypes.c_uint(0),
+        )
+        if local_fd < 0:
+            return False
+    finally:
+        os.close(pidfd)
+
+    try:
+        s = sock_mod.socket(fileno=local_fd)
+        try:
+            addr = s.getsockname()
+            family = s.family
+        finally:
+            s.detach()
+    except OSError:
+        os.close(local_fd)
+        return False
+
+    if family not in (sock_mod.AF_INET, sock_mod.AF_INET6):
+        return False
+
+    real_port = addr[1]
+    virtual = port_map.virtual_port(real_port)
+    if virtual is None:
+        virtual = real_port  # Not remapped, use as-is
+
+    # Build the sockaddr to write back
+    # sa_family is host byte order (H), sin_port is network byte order (!H)
+    if family == sock_mod.AF_INET:
+        ip_bytes = sock_mod.inet_aton(addr[0])
+        sockaddr = struct.pack("H", family)
+        sockaddr += struct.pack("!H", virtual)
+        sockaddr += ip_bytes
+        sockaddr += b"\x00" * 8  # sin_zero
+        written_len = 16
+    else:
+        ip_bytes = sock_mod.inet_pton(sock_mod.AF_INET6, addr[0])
+        flowinfo = addr[2] if len(addr) > 2 else 0
+        scope_id = addr[3] if len(addr) > 3 else 0
+        sockaddr = struct.pack("H", family)
+        sockaddr += struct.pack("!H", virtual)
+        sockaddr += struct.pack("!I", flowinfo)
+        sockaddr += ip_bytes
+        sockaddr += struct.pack("!I", scope_id)
+        written_len = 28
+
+    # Write sockaddr and addrlen into child's memory
+    try:
+        write_bytes(pid, sockaddr_addr, sockaddr)
+        write_bytes(pid, addrlen_addr, struct.pack("I", written_len))
+    except OSError:
+        return False
+
     return True

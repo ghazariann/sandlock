@@ -181,9 +181,10 @@ class TestPortRemap:
             s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
             s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 8080))
-            real = s.getsockname()[1]
+            # getsockname returns virtual port (8080), so check bind succeeds
+            name = s.getsockname()
             s.close()
-            return real
+            return name[1]
 
         policy = Policy(net_bind=["30000-30999"], port_remap=True)
 
@@ -192,13 +193,12 @@ class TestPortRemap:
 
         assert r1.success
         assert r2.success
-        assert r1.value != r2.value
-        # Both should be within the net_bind range
-        assert 30000 <= r1.value <= 30999
-        assert 30000 <= r2.value <= 30999
+        # Both see virtual port 8080 via getsockname
+        assert r1.value == 8080
+        assert r2.value == 8080
 
     def test_multiple_ports_in_one_sandbox(self):
-        """Multiple virtual ports in one sandbox get unique real ports."""
+        """Multiple virtual ports in one sandbox all bind successfully."""
         import socket as sock_mod
 
         def bind_three():
@@ -215,10 +215,8 @@ class TestPortRemap:
         result = Sandbox(policy).call(bind_three)
 
         assert result.success
-        real_ports = list(result.value.values())
-        assert len(set(real_ports)) == 3  # All unique
-        for rp in real_ports:
-            assert 31000 <= rp <= 31099
+        # getsockname returns virtual ports
+        assert result.value == {"3000": 3000, "5432": 5432, "8080": 8080}
 
     def test_same_virtual_port_remapped_consistently(self):
         """Binding the same virtual port twice in one sandbox reuses the mapping."""
@@ -259,24 +257,42 @@ class TestPortRemap:
         assert result.success
         assert result.value == 33050  # Not remapped
 
+    def test_getsockname_returns_virtual_port(self):
+        """getsockname() should return the virtual port, not the real one."""
+        import socket as sock_mod
+
+        def bind_and_check():
+            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 4000))
+            name = s.getsockname()
+            s.close()
+            return {"ip": name[0], "port": name[1]}
+
+        policy = Policy(net_bind=["35000-35099"], port_remap=True)
+        result = Sandbox(policy).call(bind_and_check)
+
+        assert result.success
+        assert result.value["port"] == 4000  # Virtual, not real
+        assert result.value["ip"] == "127.0.0.1"
+
     def test_port_outside_range_remapped(self):
-        """A port outside the net_bind range is remapped into the range."""
+        """A virtual port outside net_bind binds successfully and getsockname shows virtual."""
         import socket as sock_mod
 
         def bind_virtual():
             s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
             s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 3000))  # Outside net_bind range
-            real = s.getsockname()[1]
+            port = s.getsockname()[1]
             s.close()
-            return real
+            return port
 
         policy = Policy(net_bind=["34000-34099"], port_remap=True)
         result = Sandbox(policy).call(bind_virtual)
 
         assert result.success
-        assert 34000 <= result.value <= 34099  # Remapped into range
-        assert result.value != 3000
+        assert result.value == 3000  # getsockname returns virtual port
 
 
 class TestCpuThrottle:
