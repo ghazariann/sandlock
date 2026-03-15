@@ -50,6 +50,37 @@ def parse_memory_size(s: str) -> int:
     return int(value)
 
 
+_DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+}
+
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh])?\s*$")
+
+
+def parse_duration(s: str) -> int:
+    """Parse a human-friendly duration string to seconds.
+
+    Accepts plain integers (seconds) or suffixed values: ``'30s'``, ``'5m'``,
+    ``'1h'``.  Returns whole seconds (rounded up).
+
+    Raises:
+        ValueError: If the string cannot be parsed.
+    """
+    m = _DURATION_RE.match(s)
+    if m is None:
+        raise ValueError(f"invalid duration: {s!r}")
+    value = float(m.group(1))
+    suffix = m.group(2)
+    if suffix is not None:
+        value *= _DURATION_UNITS[suffix]
+    result = int(value)
+    if value > result:
+        result += 1  # round up
+    return result
+
+
 _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 
 
@@ -145,10 +176,15 @@ class Policy:
     """Memory limit. String like '512M' or int bytes."""
 
     max_processes: int | None = None
-    """Maximum number of processes in the sandbox."""
+    """Maximum total forks allowed in the sandbox (lifetime count, not
+    concurrent).  Also used to divide ``cpu_budget`` into per-process
+    RLIMIT_CPU.  Required when ``cpu_budget`` is set."""
 
-    max_cpu: str | None = None
-    """CPU rate limit, e.g. '50%' for 50% of one core."""
+    cpu_budget: str | int | None = None
+    """Total CPU time budget for the entire sandbox.  String like
+    ``'30s'``, ``'5m'``, ``'1h'`` or int seconds.  Divided evenly
+    across ``max_processes`` to set per-process RLIMIT_CPU.
+    Requires ``max_processes`` to be set."""
 
     # Optional chroot
     chroot: str | None = None
@@ -221,15 +257,29 @@ class Policy:
             return self.max_memory
         return parse_memory_size(self.max_memory)
 
-    def cpu_quota_us(self, period_us: int = 100_000) -> int | None:
-        """Return CPU quota in microseconds for the given period, or None.
-
-        Parses '50%' as 50000us per 100000us period.
-        """
-        if self.max_cpu is None:
+    def cpu_budget_secs(self) -> int | None:
+        """Return cpu_budget as whole seconds, or None if unset."""
+        if self.cpu_budget is None:
             return None
-        s = self.max_cpu.strip()
-        if s.endswith("%"):
-            pct = float(s[:-1])
-            return int(period_us * pct / 100)
-        return int(s)
+        if isinstance(self.cpu_budget, int):
+            return self.cpu_budget
+        return parse_duration(self.cpu_budget)
+
+    def per_process_cpu_secs(self) -> int | None:
+        """Return per-process RLIMIT_CPU value in seconds, or None.
+
+        Divides cpu_budget by max_processes (rounded up, minimum 1s).
+
+        Raises:
+            PolicyError: If cpu_budget is set without max_processes.
+        """
+        budget = self.cpu_budget_secs()
+        if budget is None:
+            return None
+        if not self.max_processes or self.max_processes <= 0:
+            from .exceptions import PolicyError
+            raise PolicyError("cpu_budget requires max_processes to be set")
+        per_proc = budget // self.max_processes
+        if budget % self.max_processes:
+            per_proc += 1  # round up
+        return max(1, per_proc)
