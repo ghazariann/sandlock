@@ -170,6 +170,115 @@ class TestSandboxNested:
         assert result.value == "DENIED"
 
 
+class TestPortRemap:
+    """Test transparent TCP port remapping."""
+
+    def test_two_sandboxes_same_virtual_port(self):
+        """Two sandboxes bind the same virtual port without conflict."""
+        import socket as sock_mod
+
+        def bind_port():
+            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 8080))
+            real = s.getsockname()[1]
+            s.close()
+            return real
+
+        policy = Policy(net_bind=["30000-30999"], port_remap=True)
+
+        r1 = Sandbox(policy).call(bind_port)
+        r2 = Sandbox(policy).call(bind_port)
+
+        assert r1.success
+        assert r2.success
+        assert r1.value != r2.value
+        # Both should be within the net_bind range
+        assert 30000 <= r1.value <= 30999
+        assert 30000 <= r2.value <= 30999
+
+    def test_multiple_ports_in_one_sandbox(self):
+        """Multiple virtual ports in one sandbox get unique real ports."""
+        import socket as sock_mod
+
+        def bind_three():
+            ports = {}
+            for vport in [3000, 5432, 8080]:
+                s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+                s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", vport))
+                ports[vport] = s.getsockname()[1]
+                s.close()
+            return ports
+
+        policy = Policy(net_bind=["31000-31099"], port_remap=True)
+        result = Sandbox(policy).call(bind_three)
+
+        assert result.success
+        real_ports = list(result.value.values())
+        assert len(set(real_ports)) == 3  # All unique
+        for rp in real_ports:
+            assert 31000 <= rp <= 31099
+
+    def test_same_virtual_port_remapped_consistently(self):
+        """Binding the same virtual port twice in one sandbox reuses the mapping."""
+        import socket as sock_mod
+
+        def bind_twice():
+            results = []
+            for _ in range(2):
+                s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+                s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", 9090))
+                results.append(s.getsockname()[1])
+                s.close()
+            return results
+
+        policy = Policy(net_bind=["32000-32099"], port_remap=True)
+        result = Sandbox(policy).call(bind_twice)
+
+        assert result.success
+        # Same virtual port should map to the same real port
+        assert result.value[0] == result.value[1]
+
+    def test_port_in_range_not_remapped(self):
+        """A port already in the net_bind range is passed through unchanged."""
+        import socket as sock_mod
+
+        def bind_real():
+            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 33050))  # Within net_bind range
+            real = s.getsockname()[1]
+            s.close()
+            return real
+
+        policy = Policy(net_bind=["33000-33099"], port_remap=True)
+        result = Sandbox(policy).call(bind_real)
+
+        assert result.success
+        assert result.value == 33050  # Not remapped
+
+    def test_port_outside_range_remapped(self):
+        """A port outside the net_bind range is remapped into the range."""
+        import socket as sock_mod
+
+        def bind_virtual():
+            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 3000))  # Outside net_bind range
+            real = s.getsockname()[1]
+            s.close()
+            return real
+
+        policy = Policy(net_bind=["34000-34099"], port_remap=True)
+        result = Sandbox(policy).call(bind_virtual)
+
+        assert result.success
+        assert 34000 <= result.value <= 34099  # Remapped into range
+        assert result.value != 3000
+
+
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""
 

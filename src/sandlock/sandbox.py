@@ -559,10 +559,11 @@ class Sandbox:
                     allowed_ips=allowed_ips,
                 )
 
-        # --- Resource limits → notif_policy for memory/process tracking ---
+        # --- Resource limits + port remap → notif_policy ---
         mem_bytes = policy.memory_bytes() or 0
         max_procs = policy.max_processes or 0
-        if mem_bytes > 0 or max_procs > 0:
+        port_remap = policy.port_remap
+        if mem_bytes > 0 or max_procs > 0 or port_remap:
             from ._notif_policy import NotifPolicy, default_proc_rules
 
             existing = overrides.get("notif_policy", policy.notif_policy)
@@ -571,12 +572,14 @@ class Sandbox:
                     existing,
                     max_memory_bytes=mem_bytes,
                     max_processes=max_procs,
+                    port_remap=port_remap,
                 )
             else:
                 overrides["notif_policy"] = NotifPolicy(
                     rules=default_proc_rules(),
                     max_memory_bytes=mem_bytes,
                     max_processes=max_procs,
+                    port_remap=port_remap,
                 )
 
         if not overrides:

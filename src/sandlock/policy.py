@@ -155,6 +155,12 @@ class Policy:
     Enforced by the parent via SIGSTOP/SIGCONT cycling on the process
     group — applies to all processes in the sandbox collectively."""
 
+    port_remap: bool = False
+    """Enable transparent TCP port remapping.  Each sandbox gets a
+    virtual port space — bind(3000) is silently remapped to a unique
+    real port.  Allows multiple sandboxes to bind the same port
+    without conflicts.  No network namespaces or root required."""
+
     # Optional chroot
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""

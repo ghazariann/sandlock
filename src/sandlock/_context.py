@@ -98,6 +98,8 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
         names.append("open")
     if notif is not None and notif.allowed_ips:
         names.extend(["connect", "sendto"])
+    if notif is not None and notif.port_remap:
+        names.extend(["bind", "connect"])
     if notif is not None and notif.max_memory_bytes > 0:
         names.extend(["mmap", "munmap", "brk", "mremap"])
     if notif is not None and notif.max_processes > 0:
@@ -644,9 +646,11 @@ class SandboxContext:
                     notify_fd = recv_fd(parent_sock)
                     parent_sock.close()
                     pids_fn = lambda pgid=pid: _pids_by_pgid(pgid)  # noqa: E731
+                    bind_ports = self._policy.bind_ports() or None
                     self._supervisor = NotifSupervisor(
                         notify_fd, pid, self._notif_policy,
                         pids_fn=pids_fn,
+                        bind_ports=bind_ports,
                     )
                     self._supervisor.start()
                 except Exception:

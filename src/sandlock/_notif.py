@@ -438,11 +438,13 @@ class NotifSupervisor:
         policy: NotifPolicy,
         *,
         pids_fn: Optional[callable] = None,
+        bind_ports: list[int] | None = None,
     ):
         self._notify_fd = notify_fd
         self._child_pid = child_pid
         self._policy = policy
         self._pids_fn = pids_fn
+        self._bind_ports = bind_ports
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
         # Resource tracking state
@@ -456,6 +458,11 @@ class NotifSupervisor:
         self._hold_forks: bool = False
         self._hold_lock = threading.Lock()
         self._held_notif_ids: list[int] = []
+        # Port remapping (sliced from net_bind via PortAllocator)
+        self._port_map = None  # PortMap | None
+        if policy.port_remap and self._bind_ports:
+            from ._port_remap import get_port_map
+            self._port_map = get_port_map(self._bind_ports)
 
     def start(self) -> None:
         """Start the supervisor thread."""
@@ -510,6 +517,11 @@ class NotifSupervisor:
         self._notify_fd = -1
         self._stop_r = -1
         self._stop_w = -1
+
+    @property
+    def port_map(self):
+        """PortMap for this sandbox, or None if port_remap is disabled."""
+        return self._port_map
 
     def _run(self) -> None:
         """Supervisor event loop."""
@@ -583,8 +595,15 @@ class NotifSupervisor:
             self._handle_fork(notif, nr)
             return
 
-        # --- Network: connect / sendto / sendmsg IP enforcement ---
+        # --- Port remapping: bind / connect ---
+        nr_bind = _SYSCALL_NR.get("bind")
         nr_connect = _SYSCALL_NR.get("connect")
+
+        if self._port_map is not None and nr in (nr_bind, nr_connect):
+            self._handle_port_remap(notif, nr)
+            return
+
+        # --- Network: connect / sendto / sendmsg IP enforcement ---
         nr_sendto = _SYSCALL_NR.get("sendto")
         nr_sendmsg = _SYSCALL_NR.get("sendmsg")
 
@@ -768,6 +787,26 @@ class NotifSupervisor:
         self._proc_pids.add(notif.pid)
         # Invalidate /proc readdir cache so new PIDs appear
         self._proc_dir_cache.clear()
+        self._respond_continue(notif.id)
+
+    def _handle_port_remap(self, notif: SeccompNotif, nr: int) -> None:
+        """Handle bind/connect — rewrite port in child's sockaddr.
+
+        Reads the sockaddr from child memory, remaps the port via the
+        sandbox's PortMap (backed by net_bind pool), writes the modified
+        sockaddr back, then lets the syscall proceed with CONTINUE.
+        """
+        from ._port_remap import _remap_sockaddr
+
+        # bind(fd, addr, addrlen) / connect(fd, addr, addrlen)
+        sockaddr_addr = notif.data.args[1]
+        addrlen = notif.data.args[2] & 0xFFFFFFFF
+
+        try:
+            _remap_sockaddr(notif.pid, sockaddr_addr, addrlen, self._port_map)
+        except OSError:
+            pass  # Can't read/write child memory — let syscall proceed as-is
+
         self._respond_continue(notif.id)
 
     def _handle_getdents(self, notif: SeccompNotif) -> None:

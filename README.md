@@ -21,7 +21,7 @@ confinement without image builds, overlay filesystems, or root privileges.
 | Startup time | ~1 ms (fork) | ~200 ms | ~100 ms | ~100 ms |
 | Kernel | Shared | Shared | Separate guest | Shared (sentry) |
 | Filesystem isolation | Landlock | Overlay | Block-level (QCOW2) | ptrace/KVM |
-| Network isolation | Landlock + seccomp notif | Network namespace | TAP device | Sentry kernel |
+| Network isolation | Landlock port range + seccomp notif port virtualization | Network namespace | TAP device | Sentry kernel |
 | Syscall filtering | seccomp-bpf | seccomp | N/A (full kernel) | Sentry kernel |
 | Resource limits | seccomp notif + SIGSTOP/SIGCONT | cgroup v2 | VM config | cgroup v2 |
 | Memory sharing | COW (fork), zero-copy | Bind-mount + re-init | Shared mem (explicit) | N/A |
@@ -191,15 +191,42 @@ Enforced via **seccomp user notification** and **SIGSTOP/SIGCONT**, no cgroups o
 | Processes | seccomp notif on `clone`/`fork`/`vfork` | `EAGAIN` when at limit |
 | CPU | Parent-side SIGSTOP/SIGCONT on process group | Throttle to N% of one core |
 | Disk | BranchFS FUSE layer (`--max-disk`) | `ENOSPC` when quota exceeded |
+| Ports | seccomp notif on `bind`/`connect` | Virtualize ports outside `net_bind` range |
 
 CPU throttling works like cgroup v2 `cpu.max` but without root: a supervisor
 thread cycles SIGSTOP/SIGCONT on the sandbox process group every 100ms.
 `max_cpu=50` means ~50ms running, ~50ms stopped per cycle, roughly 50% of
 one core.  Applies collectively to all processes in the sandbox.
 
+### Port Isolation and Virtualization
+
+Two layers, complementary:
+
+**Port isolation** (`net_bind`/`net_connect`): Landlock restricts which ports the
+sandbox may bind or connect to.  Security boundary.
+
+**Port virtualization** (`port_remap=True`): Transparent remapping so multiple
+sandboxes can use the same virtual ports without conflicts.  The app thinks it
+binds port 3000, but the real port is different.  Ports already in the
+`net_bind` range are passed through unchanged; only external virtual ports
+are remapped.
+
+```python
+policy = Policy(net_bind=["20000-20999"], port_remap=True)
+
+Sandbox(policy).call(start_web_server)   # bind(3000) -> real port 20000
+Sandbox(policy).call(start_web_server)   # bind(3000) -> real port 20100
+```
+
+The `net_bind` range provides the pool of real ports.  Landlock enforces the
+range (security), and the internal allocator slices it across sandboxes
+(isolation).  The supervisor intercepts `bind()`/`connect()` via seccomp notif,
+rewrites the port in the child's sockaddr, and lets the syscall proceed.
+No network namespaces or root required.
+
 ### Network: Domain-Based Access Control
 
-Specify allowed hostnames — everything else is blocked:
+Specify allowed hostnames -- everything else is blocked:
 
 ```python
 Policy(net_allow_hosts=["api.openai.com", "github.com"])
@@ -286,6 +313,7 @@ class Policy:
     max_memory: str | int | None = None  # '512M'
     max_processes: int = 64              # per-sandbox fork count
     max_cpu: int | None = None            # 50 = 50% of one core (SIGSTOP/SIGCONT)
+    port_remap: bool = False             # Transparent TCP port remapping
 
     # Environment
     clean_env: bool = False              # Minimal env (PATH, HOME, TERM, LANG, USER, SHELL)

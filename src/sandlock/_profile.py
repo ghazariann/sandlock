@@ -47,6 +47,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "clean_env": bool,
     "env": dict,
     # Misc
+    "port_remap": bool,
     "close_fds": bool,
     "strict": bool,
     "privileged": bool,
