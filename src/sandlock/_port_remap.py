@@ -120,6 +120,25 @@ def get_port_map(bind_ports: list[int]) -> PortMap:
         return _allocators[key].allocate()
 
 
+def _read_port(pid: int, sockaddr_addr: int, addrlen: int) -> int | None:
+    """Read the port from a sockaddr in child memory.
+
+    Returns the port number, or None if not AF_INET/AF_INET6.
+    """
+    from ._procfs import read_bytes
+
+    if addrlen < 4:
+        return None
+
+    data = read_bytes(pid, sockaddr_addr, min(addrlen, 28))
+    family = struct.unpack_from("H", data, 0)[0]
+
+    if family not in (_AF_INET, _AF_INET6):
+        return None
+
+    return struct.unpack_from("!H", data, _PORT_OFFSET)[0]
+
+
 def _remap_sockaddr(pid: int, sockaddr_addr: int, addrlen: int,
                     port_map: PortMap) -> bool:
     """Rewrite the port in a sockaddr to a real port from the pool.

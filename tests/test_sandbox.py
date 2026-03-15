@@ -331,6 +331,32 @@ class TestPortRemap:
         assert r1.success and r1.value is True
         assert r2.success and r2.value is True
 
+    def test_cross_sandbox_port_scan_blocked(self):
+        """A sandbox cannot connect to another sandbox's real port."""
+        import socket as sock_mod
+
+        def try_connect_to_other():
+            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            try:
+                # 38000 is in the full net_bind range but belongs
+                # to another sandbox's slice
+                s.connect(("127.0.0.1", 38000))
+                s.close()
+                return "CONNECTED"
+            except ConnectionRefusedError:
+                return "BLOCKED"
+            except OSError:
+                return "BLOCKED"
+
+        # Use range 38000-38199, each sandbox gets 100 ports.
+        # First sandbox takes 38000-38099, second gets 38100-38199.
+        policy = Policy(net_bind=["38000-38199"], port_remap=True)
+        _r1 = Sandbox(policy).call(lambda: True)  # Consume first slice
+
+        r2 = Sandbox(policy).call(try_connect_to_other)
+        assert r2.success
+        assert r2.value == "BLOCKED"
+
 
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""

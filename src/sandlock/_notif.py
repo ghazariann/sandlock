@@ -460,9 +460,11 @@ class NotifSupervisor:
         self._held_notif_ids: list[int] = []
         # Port remapping (sliced from net_bind via PortAllocator)
         self._port_map = None  # PortMap | None
+        self._full_port_set = None  # set[int] | None — all net_bind ports
         if policy.port_remap and self._bind_ports:
             from ._port_remap import get_port_map
             self._port_map = get_port_map(self._bind_ports)
+            self._full_port_set = set(self._bind_ports)
 
     def start(self) -> None:
         """Start the supervisor thread."""
@@ -797,20 +799,35 @@ class NotifSupervisor:
     def _handle_port_remap(self, notif: SeccompNotif, nr: int) -> None:
         """Handle bind/connect — rewrite port in child's sockaddr.
 
-        Reads the sockaddr from child memory, remaps the port via the
-        sandbox's PortMap (backed by net_bind pool), writes the modified
-        sockaddr back, then lets the syscall proceed with CONTINUE.
+        For bind: remaps virtual port to a real port from the pool.
+        For connect: remaps virtual port, and blocks connections to
+        other sandboxes' ports (prevents port scanning).
         """
-        from ._port_remap import _remap_sockaddr
+        from ._port_remap import _remap_sockaddr, _read_port
+        from ._seccomp import _SYSCALL_NR
 
-        # bind(fd, addr, addrlen) / connect(fd, addr, addrlen)
         sockaddr_addr = notif.data.args[1]
         addrlen = notif.data.args[2] & 0xFFFFFFFF
+
+        nr_connect = _SYSCALL_NR.get("connect")
+        if nr == nr_connect and self._full_port_set is not None:
+            # Block connections to other sandboxes' real ports.
+            # If target port is in the full net_bind range but not
+            # in our slice, it belongs to another sandbox.
+            try:
+                target_port = _read_port(notif.pid, sockaddr_addr, addrlen)
+                if target_port is not None:
+                    if (target_port in self._full_port_set
+                            and target_port not in self._port_map._pool_set):
+                        self._respond_errno(notif.id, errno.ECONNREFUSED)
+                        return
+            except OSError:
+                pass
 
         try:
             _remap_sockaddr(notif.pid, sockaddr_addr, addrlen, self._port_map)
         except OSError:
-            pass  # Can't read/write child memory — let syscall proceed as-is
+            pass
 
         self._respond_continue(notif.id)
 
