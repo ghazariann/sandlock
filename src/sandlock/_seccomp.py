@@ -60,6 +60,7 @@ OFFSET_ARGS0_LO = 16   # args[0] low 32 bits
 OFFSET_ARGS0_HI = 20   # args[0] high 32 bits
 OFFSET_ARGS1_LO = 24   # args[1] low 32 bits
 OFFSET_ARGS1_HI = 28   # args[1] high 32 bits
+OFFSET_ARGS2_LO = 32   # args[2] low 32 bits
 
 # EPERM
 ERRNO_EPERM = 1
@@ -318,6 +319,23 @@ def _build_arg_filters() -> bytes:
     insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS1_LO)
     # if request == TIOCSTI → deny
     insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 0, 1)
+    insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
+
+    # --- socket: block NETLINK_SOCK_DIAG (hides host socket info) ---
+    _AF_NETLINK = 16
+    _NETLINK_SOCK_DIAG = 4
+    # Load syscall number
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
+    # if nr != socket, skip ahead (5 instructions)
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _SYSCALL_NR["socket"], 0, 5)
+    # Load domain (arg0)
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO)
+    # if domain != AF_NETLINK, skip (3 instructions)
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _AF_NETLINK, 0, 3)
+    # Load protocol (arg2)
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO)
+    # if protocol == NETLINK_SOCK_DIAG → deny
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _NETLINK_SOCK_DIAG, 0, 1)
     insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
 
     return bytes(insns)
