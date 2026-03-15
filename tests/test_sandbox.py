@@ -127,6 +127,48 @@ class TestSandboxNested:
         assert isinstance(inner, Sandbox)
         assert inner.policy.max_memory == "256M"
 
+    def test_nested_sandbox_runs(self):
+        """Parent sandbox spawns a nested child sandbox via call()."""
+        parent_policy = Policy()
+        child_policy = Policy(max_processes=4)
+
+        def outer():
+            inner = Sandbox(child_policy).call(lambda: 6 * 7)
+            return inner.value
+
+        result = Sandbox(parent_policy).call(outer)
+        assert result.success
+        assert result.value == 42
+
+    def test_nested_sandbox_inherits_restrictions(self):
+        """Nested sandbox cannot escalate write access beyond parent."""
+
+        def outer():
+            # Parent sandbox has no writable paths.  The inner sandbox
+            # claims /tmp is writable, but Landlock is cumulative --
+            # the inner ruleset cannot grant more than the parent allows.
+            inner_policy = Policy(
+                fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+                fs_writable=["/tmp"],
+            )
+            def try_write():
+                import tempfile
+                try:
+                    with tempfile.NamedTemporaryFile(dir="/tmp", delete=True) as f:
+                        f.write(b"hacked")
+                    return "WRITTEN"
+                except (PermissionError, OSError):
+                    return "DENIED"
+            result = Sandbox(inner_policy).call(try_write)
+            return result.value
+
+        parent_policy = Policy(
+            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", "/tmp"],
+        )
+        result = Sandbox(parent_policy).call(outer)
+        assert result.success
+        assert result.value == "DENIED"
+
 
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""
