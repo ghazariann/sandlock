@@ -128,18 +128,25 @@ def _pids_by_pgid(pgid: int) -> list[int]:
 class SandboxContext:
     """Fork-based sandbox context.
 
-    Forks a child process and applies confinement (Landlock, seccomp,
-    seccomp) according to the given Policy.
+    Forks a child process and applies confinement (Landlock, seccomp)
+    according to the given Policy.
 
-    The child confinement sequence:
-        1. setpgid(0, 0)                  — new process group
-        2. Apply resource limits            — seccomp notif
-        3. chroot(path) if policy.chroot   — optional path illusion
-        4. confine(writable, readable)     — Landlock (irreversible)
-        5. install notif filter + send fd  — seccomp user notification (optional)
-        6. apply_seccomp(deny_syscalls)    — seccomp-bpf (irreversible)
-        7. close fds 3+ if close_fds      — fd hygiene
-        8. exec(cmd) or target(args)       — run user code
+    Child confinement sequence:
+        0. setpgid(0, 0)                  — new process group
+        1. PR_SET_PTRACER(ppid)           — allow parent to ptrace (checkpoint)
+        2. unshare(NEWUSER)               — if privileged mode
+        3. chroot(path)                   — optional root change
+        4. Landlock(fs + net + IPC)       — irreversible
+        5. checkpoint listener thread     — before seccomp (needs clone3)
+        6. seccomp filter                 — irreversible
+        7. close fds 3+                   — fd hygiene
+        8. clean_env + env overrides      — environment setup
+        9. exec(cmd) or target()          — run user code
+
+    Parent side (after fork):
+        - write uid/gid maps             — if privileged mode
+        - receive notify fd              — start seccomp supervisor thread
+        - start throttle thread           — if max_cpu is set
     """
 
     def __init__(
