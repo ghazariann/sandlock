@@ -110,6 +110,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "host", None):
         try:
             from .deploy._sandbox import RemoteSandbox
+            from .deploy._target import load_target
         except ImportError:
             print(
                 "error: --host requires sandlock[deploy].\n"
@@ -118,7 +119,26 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
             return 1
 
-        sb = RemoteSandbox(policy, host=args.host)
+        host = args.host
+        workdir = None
+        remote_profile = args.profile
+
+        # Resolve target name if it doesn't look like a host
+        if "@" not in host and "." not in host:
+            try:
+                target = load_target(host)
+                host = target.host
+                workdir = target.workdir
+                if not remote_profile and target.profile:
+                    remote_profile = target.profile
+            except (FileNotFoundError, KeyError):
+                pass
+
+        # For remote: prefer passing profile name (uses remote profile file)
+        if remote_profile:
+            sb = RemoteSandbox(remote_profile, host=host, workdir=workdir)
+        else:
+            sb = RemoteSandbox(policy, host=host, workdir=workdir)
         try:
             if args.exec_shell:
                 result = sb.run_shell(args.exec_shell, timeout=args.timeout)

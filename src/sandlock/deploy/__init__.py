@@ -16,3 +16,4 @@ except ImportError:
 
 from ._remote import deploy, verify
 from ._sandbox import RemoteSandbox
+from ._target import Target, load_target, load_targets

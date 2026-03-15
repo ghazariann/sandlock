@@ -64,13 +64,19 @@ def deploy(
     pubkey: str | None = None,
     force_command: bool = False,
     remote_python: str = "python3",
-) -> None:
+    repo: str | None = None,
+    branch: str | None = None,
+    workdir: str | None = None,
+    setup: str | None = None,
+) -> str:
     """Deploy sandlock to a remote host.
 
     Steps:
       1. Build and upload sandlock wheel, pip install it
       2. Push profile if specified
-      3. Configure authorized_keys or ForceCommand
+      3. Clone/pull git repo if specified
+      4. Run setup commands if specified
+      5. Configure authorized_keys or ForceCommand
 
     Returns the remote sandlock binary path.
     """
@@ -109,7 +115,49 @@ def deploy(
         ssh.write_remote(remote_profile, profile_content)
         print(f"  profile uploaded to: {remote_profile}")
 
-    # Step 3: Configure SSH
+    # Step 3: Clone/pull git repo
+    if repo:
+        # Determine clone directory
+        if workdir:
+            repo_dir = workdir
+        else:
+            # Derive from repo URL: git@host:org/project.git -> project
+            repo_name = repo.rstrip("/").rsplit("/", 1)[-1]
+            if repo_name.endswith(".git"):
+                repo_name = repo_name[:-4]
+            rc, home_out, _ = ssh.exec("echo $HOME")
+            repo_dir = f"{home_out.strip()}/{repo_name}"
+
+        rc, _, _ = ssh.exec(f"test -d {repo_dir}/.git")
+        if rc == 0:
+            print(f"Updating repo in {repo_dir}...")
+            pull_cmd = f"cd {repo_dir} && git pull"
+            if branch:
+                pull_cmd = f"cd {repo_dir} && git checkout {branch} && git pull"
+            rc, out, err = ssh.exec(pull_cmd)
+            if rc != 0:
+                raise RuntimeError(f"git pull failed:\n{err}")
+        else:
+            print(f"Cloning {repo} to {repo_dir}...")
+            clone_cmd = f"git clone {repo} {repo_dir}"
+            if branch:
+                clone_cmd = f"git clone -b {branch} {repo} {repo_dir}"
+            rc, out, err = ssh.exec(clone_cmd)
+            if rc != 0:
+                raise RuntimeError(f"git clone failed:\n{err}")
+        print(f"  repo ready: {repo_dir}")
+
+    # Step 4: Run setup commands
+    if setup:
+        run_dir = workdir or repo_dir if repo else None
+        setup_cmd = f"cd {run_dir} && {setup}" if run_dir else setup
+        print(f"Running setup: {setup}")
+        rc, out, err = ssh.exec(setup_cmd)
+        if rc != 0:
+            raise RuntimeError(f"setup failed:\n{err}")
+        print("  setup complete")
+
+    # Step 5: Configure SSH
     if pubkey or force_command:
         rc, home_out, _ = ssh.exec("echo $HOME")
         remote_home = home_out.strip()

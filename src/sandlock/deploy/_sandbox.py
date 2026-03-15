@@ -72,6 +72,7 @@ class RemoteSandbox:
         port: int = 22,
         key_file: str | None = None,
         sandlock_bin: str = "sandlock",
+        workdir: str | None = None,
     ):
         if isinstance(policy, str):
             self._profile_name = policy
@@ -79,6 +80,8 @@ class RemoteSandbox:
         else:
             self._profile_name = None
             self._policy = policy
+
+        self._workdir = workdir
 
         # Parse user@host
         if "@" in host:
@@ -110,6 +113,10 @@ class RemoteSandbox:
             parts += ["--profile", self._profile_name]
         elif self._policy:
             parts += _policy_to_cli_flags(self._policy)
+
+        # Auto-allow workdir in sandbox
+        if self._workdir:
+            parts += ["-r", self._workdir, "-w", self._workdir]
 
         if timeout is not None:
             parts += ["-t", str(timeout)]
@@ -157,6 +164,9 @@ class RemoteSandbox:
             parts += ["--profile", self._profile_name]
         elif self._policy:
             parts += _policy_to_cli_flags(self._policy)
+        if self._workdir:
+            parts += ["-r", self._workdir, "-w", self._workdir]
+            command = f"cd {self._workdir} && {command}"
         if timeout is not None:
             parts += ["-t", str(timeout)]
         parts += ["-e", command]
