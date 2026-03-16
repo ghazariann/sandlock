@@ -50,7 +50,24 @@ class CowBranch(CowBranchBase):
         return self._finished
 
     def create(self) -> Path:
-        """Create the COW upper directory."""
+        """Create the COW upper directory.
+
+        Also cleans up any orphaned storage dirs from killed processes.
+        """
+        # Clean stale dirs from previous crashed runs
+        if self._storage.exists():
+            for entry in self._storage.iterdir():
+                if entry.is_dir():
+                    try:
+                        # Check if the owning process is still alive
+                        # Storage parent is /tmp/sandlock-cow-<pid>
+                        parts = self._storage.name.split("-")
+                        if len(parts) >= 3 and parts[-1].isdigit():
+                            pid = int(parts[-1])
+                            os.kill(pid, 0)  # check if alive
+                    except (ProcessLookupError, ValueError):
+                        shutil.rmtree(str(entry), ignore_errors=True)
+
         self._branch_id = uuid.uuid4().hex[:12]
         branch_dir = self._storage / self._branch_id
         branch_dir.mkdir(parents=True, exist_ok=True)
