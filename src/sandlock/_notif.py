@@ -19,6 +19,7 @@ import os
 import select
 import signal
 import socket
+from pathlib import Path
 import struct
 import threading
 from typing import Optional
@@ -646,9 +647,19 @@ class NotifSupervisor:
             self._handle_net(notif, nr)
             return
 
-        # --- /proc readdir PID filtering ---
+        # --- /proc readdir PID filtering + COW dir merging ---
         nr_getdents64 = _SYSCALL_NR.get("getdents64")
         nr_getdents = _SYSCALL_NR.get("getdents")
+
+        if nr in (nr_getdents64, nr_getdents) and self._cow_handler is not None:
+            child_fd_num = notif.data.args[0] & 0xFFFFFFFF
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{child_fd_num}")
+            except OSError:
+                target = ""
+            if self._cow_handler.matches(target):
+                self._handle_cow_getdents(notif, target)
+                return
 
         if nr in (nr_getdents64, nr_getdents) and self._policy.isolate_pids:
             self._handle_getdents(notif)
@@ -1090,6 +1101,66 @@ class NotifSupervisor:
 
         # Fallback: let the syscall proceed normally
         self._respond_continue(notif.id)
+
+    def _handle_cow_getdents(self, notif: SeccompNotif, dir_path: str) -> None:
+        """Handle getdents64 for COW directories — merge upper + lower entries."""
+        pid = notif.pid
+        child_fd_num = notif.data.args[0] & 0xFFFFFFFF
+        buf_addr = notif.data.args[1]
+        buf_size = notif.data.args[2] & 0xFFFFFFFF
+
+        cache_key = ("cow", pid, child_fd_num)
+        if cache_key not in self._proc_dir_cache:
+            workdir = self._cow_handler.workdir
+            rel_path = os.path.relpath(dir_path, workdir)
+            merged_names = self._cow_handler.list_merged_dir(rel_path)
+
+            DT_DIR = 4
+            DT_REG = 8
+            DT_LNK = 10
+            entries = []
+            d_off = 0
+            for name in merged_names:
+                d_off += 1
+                # Determine type from upper or lower
+                upper_p = self._cow_handler.upper_dir / rel_path / name
+                lower_p = Path(workdir) / rel_path / name
+                check = upper_p if upper_p.exists() else lower_p
+                if check.is_dir():
+                    d_type = DT_DIR
+                elif check.is_symlink():
+                    d_type = DT_LNK
+                else:
+                    d_type = DT_REG
+                entries.append(_build_dirent64(d_off, d_off, d_type, name))
+
+            self._proc_dir_cache[cache_key] = entries
+
+        entries = self._proc_dir_cache[cache_key]
+
+        if not self._id_valid(notif.id):
+            return
+
+        result = bytearray()
+        consumed = 0
+        for entry in entries:
+            if len(result) + len(entry) > buf_size:
+                break
+            result.extend(entry)
+            consumed += 1
+
+        if consumed > 0:
+            self._proc_dir_cache[cache_key] = entries[consumed:]
+        elif not entries:
+            del self._proc_dir_cache[cache_key]
+
+        try:
+            if result:
+                write_bytes(pid, buf_addr, bytes(result))
+            self._respond_val(notif.id, len(result))
+        except OSError:
+            self._proc_dir_cache.pop(cache_key, None)
+            self._respond_continue(notif.id)
 
     def _handle_getdents(self, notif: SeccompNotif) -> None:
         """Handle getdents64/getdents — filter /proc readdir to hide foreign PIDs.

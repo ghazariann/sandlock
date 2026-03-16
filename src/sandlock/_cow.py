@@ -172,6 +172,11 @@ class CowHandler:
             Path to open (in upper or lower dir), or None to let
             the kernel handle it (path not found in either).
         """
+        # Don't redirect directory opens — getdents handles dir merging
+        O_DIRECTORY = 0o200000
+        if flags & O_DIRECTORY:
+            return None
+
         rel_path = os.path.relpath(path, self._workdir_str)
         is_write = bool(flags & _WRITE_FLAGS)
 
@@ -263,18 +268,21 @@ class CowHandler:
         entries = set()
         whiteouts = set()
 
-        # Collect whiteouts
-        wh_dir = self._branch.upper_dir
-        for wh in wh_dir.glob(f".wh.{rel_path}/*") if rel_path != "." else wh_dir.glob(".wh.*"):
-            whiteouts.add(wh.name)
+        # Collect whiteouts — stored as .wh.<name> in the upper dir
+        # For rel_path ".", whiteouts are .wh.<name> in upper root
+        wh_search = self._branch.upper_dir if rel_path == "." else upper_dir
+        if wh_search.is_dir():
+            for e in wh_search.iterdir():
+                if e.name.startswith(".wh."):
+                    whiteouts.add(e.name[4:])  # strip ".wh." prefix
 
-        # Upper entries
+        # Upper entries (skip whiteout markers)
         if upper_dir.is_dir():
             for e in upper_dir.iterdir():
                 if not e.name.startswith(".wh."):
                     entries.add(e.name)
 
-        # Lower entries (not whited out)
+        # Lower entries (not whited out, not already in upper)
         if lower_dir.is_dir():
             for e in lower_dir.iterdir():
                 if e.name not in whiteouts:
