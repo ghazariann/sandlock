@@ -85,6 +85,9 @@ class NotifPolicy:
     port_remap: bool = False
     """If True, bind/connect ports are transparently remapped."""
 
+    cow_enabled: bool = False
+    """If True, filesystem COW syscalls (unlinkat, mkdirat, etc.) are intercepted."""
+
     def decide(
         self,
         path: str,

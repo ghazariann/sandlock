@@ -632,12 +632,19 @@ class Sandbox:
                     port_remap=port_remap,
                 )
 
-        # --- CowBranch: ensure notif policy exists so supervisor starts ---
+        # --- CowBranch: ensure notif policy with cow_enabled ---
         from ._cow import CowBranch
         if isinstance(self._branch, CowBranch):
-            if "notif_policy" not in overrides and policy.notif_policy is None:
-                from ._notif_policy import NotifPolicy, default_proc_rules
-                overrides["notif_policy"] = NotifPolicy(rules=default_proc_rules())
+            from ._notif_policy import NotifPolicy, default_proc_rules
+            existing = overrides.get("notif_policy", policy.notif_policy)
+            if existing is not None:
+                overrides["notif_policy"] = dataclasses.replace(
+                    existing, cow_enabled=True,
+                )
+            else:
+                overrides["notif_policy"] = NotifPolicy(
+                    rules=default_proc_rules(), cow_enabled=True,
+                )
 
         if not overrides:
             result = policy

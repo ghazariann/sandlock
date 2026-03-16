@@ -654,6 +654,94 @@ class NotifSupervisor:
             self._handle_getdents(notif)
             return
 
+        # --- COW: filesystem modification syscalls ---
+        if self._cow_handler is not None:
+            nr_unlinkat = _SYSCALL_NR.get("unlinkat")
+            nr_unlink = _SYSCALL_NR.get("unlink")
+            nr_mkdirat = _SYSCALL_NR.get("mkdirat")
+            nr_mkdir = _SYSCALL_NR.get("mkdir")
+            nr_renameat2 = _SYSCALL_NR.get("renameat2")
+            nr_rename = _SYSCALL_NR.get("rename")
+            nr_newfstatat = _SYSCALL_NR.get("newfstatat")
+            nr_statx = _SYSCALL_NR.get("statx")
+            nr_faccessat = _SYSCALL_NR.get("faccessat")
+            nr_stat = _SYSCALL_NR.get("stat")
+            nr_lstat = _SYSCALL_NR.get("lstat")
+            nr_access = _SYSCALL_NR.get("access")
+
+            # *at variants: dirfd=arg0, pathname=arg1
+            cow_at_nrs = {nr_unlinkat, nr_mkdirat, nr_renameat2,
+                          nr_newfstatat, nr_statx, nr_faccessat} - {None}
+            # non-at variants: pathname=arg0
+            cow_plain_nrs = {nr_unlink, nr_mkdir, nr_rename,
+                             nr_stat, nr_lstat, nr_access} - {None}
+
+            if nr in cow_at_nrs or nr in cow_plain_nrs:
+                try:
+                    if nr in cow_at_nrs:
+                        dirfd = ctypes.c_int32(notif.data.args[0] & 0xFFFFFFFF).value
+                        pathname_addr = notif.data.args[1]
+                        path = resolve_openat_path(pid, dirfd, pathname_addr)
+                    else:
+                        pathname_addr = notif.data.args[0]
+                        path = resolve_openat_path(pid, -100, pathname_addr)
+                except OSError:
+                    self._respond_continue(notif.id)
+                    return
+
+                if not self._id_valid(notif.id):
+                    return
+
+                if self._cow_handler.matches(path):
+                    # unlink / unlinkat
+                    if nr in (nr_unlinkat, nr_unlink):
+                        if self._cow_handler.handle_unlink(path):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # mkdir / mkdirat
+                    if nr in (nr_mkdirat, nr_mkdir):
+                        mode = notif.data.args[2] if nr == nr_mkdirat else notif.data.args[1]
+                        if self._cow_handler.handle_mkdir(path, mode):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # rename / renameat2
+                    if nr in (nr_renameat2, nr_rename):
+                        try:
+                            if nr == nr_renameat2:
+                                newdirfd = ctypes.c_int32(notif.data.args[2] & 0xFFFFFFFF).value
+                                newpath_addr = notif.data.args[3]
+                                new_path = resolve_openat_path(pid, newdirfd, newpath_addr)
+                            else:
+                                newpath_addr = notif.data.args[1]
+                                new_path = resolve_openat_path(pid, -100, newpath_addr)
+                        except OSError:
+                            self._respond_continue(notif.id)
+                            return
+                        if self._cow_handler.handle_rename(path, new_path):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # stat / lstat / newfstatat / statx / access / faccessat
+                    if nr in (nr_newfstatat, nr_statx, nr_faccessat,
+                              nr_stat, nr_lstat, nr_access):
+                        real_path = self._cow_handler.handle_stat(path)
+                        if real_path is None:
+                            self._respond_errno(notif.id, errno.ENOENT)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                self._respond_continue(notif.id)
+                return
+
         # --- Filesystem: open / openat virtualization + COW ---
         nr_openat = _SYSCALL_NR.get("openat")
         nr_open = _SYSCALL_NR.get("open")

@@ -108,6 +108,20 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
         names.append("getdents64")
         if "getdents" in _SYSCALL_NR:
             names.append("getdents")
+    if notif is not None and notif.cow_enabled:
+        cow_syscalls = [
+            "unlinkat", "mkdirat", "renameat2",
+            "newfstatat", "statx", "faccessat",
+            "getdents64",
+            # Non-at variants (x86_64 has both, aarch64 only has *at)
+            "unlink", "mkdir", "rename",
+            "stat", "lstat", "access",
+        ]
+        for name in cow_syscalls:
+            if name in _SYSCALL_NR:
+                names.append(name)
+        if "getdents" in _SYSCALL_NR:
+            names.append("getdents")
     # Deduplicate (clone/open may already be in the list)
     return list(dict.fromkeys(names))
 

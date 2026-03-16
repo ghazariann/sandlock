@@ -187,6 +187,101 @@ class CowHandler:
                 return str(resolved)
             return None
 
+    def handle_unlink(self, path: str) -> bool:
+        """Handle unlinkat: delete from upper, create whiteout.
+
+        Returns True if handled (respond errno 0), False to continue.
+        """
+        rel_path = os.path.relpath(path, self._workdir_str)
+        upper_file = self._branch.upper_dir / rel_path
+        lower_file = Path(self._workdir_str) / rel_path
+
+        # Delete from upper if exists
+        if upper_file.exists():
+            upper_file.unlink()
+
+        # If file exists in lower, create a whiteout marker
+        if lower_file.exists():
+            upper_file.parent.mkdir(parents=True, exist_ok=True)
+            # Use an empty file as whiteout marker (not a char device,
+            # since we can't create those without root)
+            whiteout = self._branch.upper_dir / f".wh.{rel_path}"
+            whiteout.parent.mkdir(parents=True, exist_ok=True)
+            whiteout.touch()
+            return True
+
+        # File doesn't exist in either — let kernel return ENOENT
+        return False
+
+    def handle_mkdir(self, path: str, mode: int) -> bool:
+        """Handle mkdirat: create directory in upper.
+
+        Returns True if handled, False to continue.
+        """
+        rel_path = os.path.relpath(path, self._workdir_str)
+        upper_dir = self._branch.upper_dir / rel_path
+        upper_dir.mkdir(parents=True, exist_ok=True)
+        return True
+
+    def handle_stat(self, path: str) -> str | None:
+        """Handle newfstatat/statx: resolve to upper or lower path.
+
+        Returns the real path to stat, or None to continue.
+        """
+        rel_path = os.path.relpath(path, self._workdir_str)
+
+        # Check for whiteout (deleted file)
+        whiteout = self._branch.upper_dir / f".wh.{rel_path}"
+        if whiteout.exists():
+            return None  # file was deleted — kernel returns ENOENT
+
+        resolved = self._branch.resolve_read(rel_path)
+        if resolved.exists():
+            return str(resolved)
+        return None
+
+    def handle_rename(self, old_path: str, new_path: str) -> bool:
+        """Handle renameat2: rename in upper dir.
+
+        Returns True if handled, False to continue.
+        """
+        old_rel = os.path.relpath(old_path, self._workdir_str)
+        new_rel = os.path.relpath(new_path, self._workdir_str)
+
+        # Ensure source exists in upper (COW copy if needed)
+        old_upper = self._branch.ensure_cow_copy(old_rel)
+        new_upper = self._branch.upper_dir / new_rel
+        new_upper.parent.mkdir(parents=True, exist_ok=True)
+        old_upper.rename(new_upper)
+        return True
+
+    def list_merged_dir(self, rel_path: str) -> list[str]:
+        """List directory entries merging upper + lower, minus whiteouts."""
+        lower_dir = Path(self._workdir_str) / rel_path
+        upper_dir = self._branch.upper_dir / rel_path
+
+        entries = set()
+        whiteouts = set()
+
+        # Collect whiteouts
+        wh_dir = self._branch.upper_dir
+        for wh in wh_dir.glob(f".wh.{rel_path}/*") if rel_path != "." else wh_dir.glob(".wh.*"):
+            whiteouts.add(wh.name)
+
+        # Upper entries
+        if upper_dir.is_dir():
+            for e in upper_dir.iterdir():
+                if not e.name.startswith(".wh."):
+                    entries.add(e.name)
+
+        # Lower entries (not whited out)
+        if lower_dir.is_dir():
+            for e in lower_dir.iterdir():
+                if e.name not in whiteouts:
+                    entries.add(e.name)
+
+        return sorted(entries)
+
     @property
     def upper_dir(self) -> Path:
         return self._branch.upper_dir
