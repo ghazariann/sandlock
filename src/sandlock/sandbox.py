@@ -496,7 +496,7 @@ class Sandbox:
         if self._policy.workdir and self._policy.fs_isolation == FsIsolation.NONE:
             if self._branch is not None:
                 return self._branch
-            from ._cow import CowBranch
+            from .cowfs._branch import CowBranch
             from pathlib import Path
             storage = Path(self._policy.fs_storage) if self._policy.fs_storage else None
             self._branch = CowBranch(Path(self._policy.workdir), storage)
@@ -633,7 +633,7 @@ class Sandbox:
                 )
 
         # --- CowBranch: ensure notif policy with cow_enabled ---
-        from ._cow import CowBranch
+        from .cowfs._branch import CowBranch
         if isinstance(self._branch, CowBranch):
             from ._notif_policy import NotifPolicy, default_proc_rules
             existing = overrides.get("notif_policy", policy.notif_policy)

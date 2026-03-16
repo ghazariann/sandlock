@@ -753,7 +753,7 @@ class SandboxContext:
                     )
                     # Attach COW handler for seccomp-based COW
                     if self._cow_branch is not None:
-                        from ._cow import CowHandler
+                        from .cowfs._handler import CowHandler
                         self._supervisor._cow_handler = CowHandler(self._cow_branch)
                     self._supervisor.start()
                 except Exception:
