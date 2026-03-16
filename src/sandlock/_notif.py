@@ -322,40 +322,6 @@ _AF_INET = 2
 _AF_INET6 = 10
 
 
-def _parse_dest_ip(pid: int, addr: int, addrlen: int) -> str | None:
-    """Read a sockaddr from child memory and extract the destination IP.
-
-    Returns the IP string, or None if the address family is not
-    AF_INET/AF_INET6 (e.g. AF_UNIX, AF_NETLINK — not filtered).
-    """
-    if addrlen < 4:
-        return None
-    data = read_bytes(pid, addr, min(addrlen, 28))
-    family = struct.unpack_from("H", data, 0)[0]
-    try:
-        if family == _AF_INET and len(data) >= 8:
-            return socket.inet_ntop(socket.AF_INET, data[4:8])
-        if family == _AF_INET6 and len(data) >= 24:
-            return socket.inet_ntop(socket.AF_INET6, data[8:24])
-    except (ValueError, OSError):
-        return None  # Malformed sockaddr — pass through
-    return None  # AF_UNIX etc. — pass through
-
-
-def _parse_msghdr_dest_ip(pid: int, msghdr_addr: int) -> str | None:
-    """Extract the destination IP from a sendmsg() msghdr.
-
-    struct msghdr { void *msg_name, socklen_t msg_namelen, ... }
-    On x86_64/aarch64: msg_name is 8 bytes, msg_namelen is 4 bytes.
-    """
-    # Read msg_name (pointer) + msg_namelen (u32) = first 12 bytes
-    hdr = read_bytes(pid, msghdr_addr, 12)
-    name_addr = struct.unpack_from("Q", hdr, 0)[0]  # void *msg_name
-    name_len = struct.unpack_from("I", hdr, 8)[0]    # socklen_t msg_namelen
-    if name_addr == 0 or name_len == 0:
-        return None  # No destination — connected socket, pass through
-    return _parse_dest_ip(pid, name_addr, name_len)
-
 
 # --- getdents64 helpers ---
 
@@ -625,11 +591,12 @@ class NotifSupervisor:
             return
 
         # --- Network: connect / sendto / sendmsg IP enforcement ---
-        nr_sendto = _SYSCALL_NR.get("sendto")
-        nr_sendmsg = _SYSCALL_NR.get("sendmsg")
+        from ._network import NET_NRS, handle_net
 
-        if nr in (nr_connect, nr_sendto, nr_sendmsg) and self._policy.allowed_ips:
-            self._handle_net(notif, nr)
+        if nr in NET_NRS and self._policy.allowed_ips:
+            handle_net(notif, nr, self._policy.allowed_ips,
+                       self._id_valid, self._respond_continue,
+                       self._respond_errno)
             return
 
         # --- /proc readdir PID filtering + COW dir merging ---
@@ -988,48 +955,7 @@ class NotifSupervisor:
             ctypes.byref(resp),
         )
 
-    def _handle_net(self, notif: SeccompNotif, nr: int) -> None:
-        """Handle connect/sendto/sendmsg — check destination IP against allowlist."""
-        pid = notif.pid
-        nr_connect = _SYSCALL_NR.get("connect")
-        nr_sendmsg = _SYSCALL_NR.get("sendmsg")
-
-        try:
-            if nr == nr_connect:
-                # connect(fd, addr, addrlen)
-                dest_ip = _parse_dest_ip(pid, notif.data.args[1],
-                                         notif.data.args[2] & 0xFFFFFFFF)
-            elif nr == nr_sendmsg:
-                # sendmsg(fd, msghdr*, flags)
-                dest_ip = _parse_msghdr_dest_ip(pid, notif.data.args[1])
-            else:
-                # sendto(fd, buf, len, flags, addr, addrlen)
-                addr_ptr = notif.data.args[4]
-                if addr_ptr == 0:
-                    # NULL addr on connected socket — allow
-                    self._respond_continue(notif.id)
-                    return
-                dest_ip = _parse_dest_ip(pid, addr_ptr,
-                                         notif.data.args[5] & 0xFFFFFFFF)
-        except Exception:
-            # Can't read child memory or parse sockaddr — allow through
-            self._respond_continue(notif.id)
-            return
-
-        if not self._id_valid(notif.id):
-            return
-
-        # Non-IP families (AF_UNIX, AF_NETLINK) or NULL msghdr dest — pass through
-        if dest_ip is None:
-            self._respond_continue(notif.id)
-            return
-
-        if dest_ip in self._policy.allowed_ips:
-            self._respond_continue(notif.id)
-        else:
-            self._respond_errno(notif.id, errno.ECONNREFUSED)
-
-    # Memory and fork handlers moved to _resource.py
+    # Network, memory, and fork handlers moved to _network.py and _resource.py
 
     def _handle_port_remap(self, notif: SeccompNotif, nr: int) -> None:
         """Handle bind/connect — rewrite port in child's sockaddr.
