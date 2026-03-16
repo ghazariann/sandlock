@@ -26,7 +26,7 @@ from typing import Optional
 
 from .exceptions import NotifError
 from ._notif_policy import NotifAction, NotifPolicy
-from ._procfs import read_bytes, write_bytes, resolve_openat_path
+from ._procfs import read_bytes, read_cstring, write_bytes, resolve_openat_path
 from ._seccomp import (
     AUDIT_ARCH,
     BPF_ABS,
@@ -680,13 +680,84 @@ class NotifSupervisor:
             nr_stat = _SYSCALL_NR.get("stat")
             nr_lstat = _SYSCALL_NR.get("lstat")
             nr_access = _SYSCALL_NR.get("access")
+            nr_symlinkat = _SYSCALL_NR.get("symlinkat")
+            nr_symlink = _SYSCALL_NR.get("symlink")
+            nr_linkat = _SYSCALL_NR.get("linkat")
+            nr_link = _SYSCALL_NR.get("link")
+            nr_fchmodat = _SYSCALL_NR.get("fchmodat")
+            nr_chmod = _SYSCALL_NR.get("chmod")
+            nr_readlinkat = _SYSCALL_NR.get("readlinkat")
+            nr_readlink = _SYSCALL_NR.get("readlink")
+            nr_truncate = _SYSCALL_NR.get("truncate")
 
             # *at variants: dirfd=arg0, pathname=arg1
             cow_at_nrs = {nr_unlinkat, nr_mkdirat, nr_renameat2,
-                          nr_newfstatat, nr_statx, nr_faccessat} - {None}
+                          nr_newfstatat, nr_statx, nr_faccessat,
+                          nr_fchmodat, nr_readlinkat} - {None}
             # non-at variants: pathname=arg0
             cow_plain_nrs = {nr_unlink, nr_rmdir, nr_mkdir, nr_rename,
-                             nr_stat, nr_lstat, nr_access} - {None}
+                             nr_stat, nr_lstat, nr_access,
+                             nr_chmod, nr_readlink, nr_truncate} - {None}
+            # Special arg layouts
+            cow_special_nrs = {nr_symlinkat, nr_symlink,
+                               nr_linkat, nr_link} - {None}
+
+            # symlink/link have special arg layouts — handle separately
+            if nr in cow_special_nrs:
+                try:
+                    if nr == nr_symlinkat:
+                        # symlinkat(target, newdirfd, linkpath)
+                        # target is a raw string (not resolved), linkpath is resolved
+                        target_addr = notif.data.args[0]
+                        target_str = read_cstring(pid, target_addr)
+                        newdirfd = ctypes.c_int32(notif.data.args[1] & 0xFFFFFFFF).value
+                        linkpath_addr = notif.data.args[2]
+                        linkpath = resolve_openat_path(pid, newdirfd, linkpath_addr)
+                    elif nr == nr_symlink:
+                        # symlink(target, linkpath)
+                        target_addr = notif.data.args[0]
+                        target_str = read_cstring(pid, target_addr)
+                        linkpath_addr = notif.data.args[1]
+                        linkpath = resolve_openat_path(pid, -100, linkpath_addr)
+                    elif nr == nr_linkat:
+                        # linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+                        olddirfd = ctypes.c_int32(notif.data.args[0] & 0xFFFFFFFF).value
+                        oldpath_addr = notif.data.args[1]
+                        target_str = resolve_openat_path(pid, olddirfd, oldpath_addr)
+                        newdirfd = ctypes.c_int32(notif.data.args[2] & 0xFFFFFFFF).value
+                        newpath_addr = notif.data.args[3]
+                        linkpath = resolve_openat_path(pid, newdirfd, newpath_addr)
+                    elif nr == nr_link:
+                        # link(oldpath, newpath)
+                        oldpath_addr = notif.data.args[0]
+                        target_str = resolve_openat_path(pid, -100, oldpath_addr)
+                        newpath_addr = notif.data.args[1]
+                        linkpath = resolve_openat_path(pid, -100, newpath_addr)
+                    else:
+                        self._respond_continue(notif.id)
+                        return
+                except OSError:
+                    self._respond_continue(notif.id)
+                    return
+
+                if not self._id_valid(notif.id):
+                    return
+
+                if self._cow_handler.matches(linkpath):
+                    if nr in (nr_symlinkat, nr_symlink):
+                        if self._cow_handler.handle_symlink(target_str, linkpath):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                    elif nr in (nr_linkat, nr_link):
+                        if self._cow_handler.handle_link(target_str, linkpath):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                    return
+
+                self._respond_continue(notif.id)
+                return
 
             if nr in cow_at_nrs or nr in cow_plain_nrs:
                 try:
@@ -770,6 +841,33 @@ class NotifSupervisor:
                             self._respond_errno(notif.id, errno.ENOENT)
                         else:
                             self._respond_continue(notif.id)
+                        return
+
+                    # chmod / fchmodat
+                    if nr in (nr_fchmodat, nr_chmod):
+                        mode = notif.data.args[2] if nr == nr_fchmodat else notif.data.args[1]
+                        if self._cow_handler.handle_chmod(path, mode & 0o7777):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # truncate (path-based)
+                    if nr == nr_truncate:
+                        length = notif.data.args[1]
+                        if self._cow_handler.handle_truncate(path, length):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # readlink / readlinkat
+                    if nr in (nr_readlinkat, nr_readlink):
+                        target = self._cow_handler.handle_readlink(path)
+                        if target is not None:
+                            self._handle_cow_readlink(notif, nr, target)
+                        else:
+                            self._respond_errno(notif.id, errno.EINVAL)
                         return
 
                 self._respond_continue(notif.id)
@@ -1181,6 +1279,33 @@ class NotifSupervisor:
         try:
             write_bytes(notif.pid, statbuf_addr, packed)
             self._respond_val(notif.id, 0)
+        except OSError:
+            self._respond_continue(notif.id)
+
+    def _handle_cow_readlink(self, notif: SeccompNotif, nr: int, target: str) -> None:
+        """Write readlink result to child's buffer."""
+        from ._procfs import write_bytes
+
+        nr_readlinkat = _SYSCALL_NR.get("readlinkat")
+
+        if nr == nr_readlinkat:
+            # readlinkat(dirfd, pathname, buf, bufsiz)
+            buf_addr = notif.data.args[2]
+            bufsiz = notif.data.args[3] & 0xFFFFFFFF
+        else:
+            # readlink(pathname, buf, bufsiz)
+            buf_addr = notif.data.args[1]
+            bufsiz = notif.data.args[2] & 0xFFFFFFFF
+
+        target_bytes = target.encode()
+        write_len = min(len(target_bytes), bufsiz)
+
+        if not self._id_valid(notif.id):
+            return
+
+        try:
+            write_bytes(notif.pid, buf_addr, target_bytes[:write_len])
+            self._respond_val(notif.id, write_len)
         except OSError:
             self._respond_continue(notif.id)
 

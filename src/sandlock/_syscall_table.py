@@ -30,7 +30,7 @@ X86_64_SYSCALLS: dict[str, int] = {
     "setsockopt": 54, "getsockopt": 55, "clone": 56,
     "fork": 57, "vfork": 58, "execve": 59, "exit": 60,
     "wait4": 61, "kill": 62, "uname": 63, "fcntl": 72,
-    "flock": 73, "ftruncate": 77, "getdents": 78,
+    "flock": 73, "truncate": 76, "ftruncate": 77, "getdents": 78,
     "getcwd": 79, "chdir": 80, "fchdir": 81, "rename": 82,
     "mkdir": 83, "rmdir": 84, "link": 86, "unlink": 87,
     "symlink": 88, "readlink": 89, "chmod": 90, "fchmod": 91,

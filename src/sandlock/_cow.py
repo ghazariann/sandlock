@@ -329,6 +329,54 @@ class CowHandler:
 
         return sorted(entries)
 
+    def handle_symlink(self, target: str, linkpath: str) -> bool:
+        """Handle symlink/symlinkat: create symlink in upper."""
+        rel_path = os.path.relpath(linkpath, self._workdir_str)
+        upper_link = self._branch.upper_dir / rel_path
+        upper_link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, str(upper_link))
+        return True
+
+    def handle_link(self, oldpath: str, newpath: str) -> bool:
+        """Handle link/linkat: create hard link in upper."""
+        old_rel = os.path.relpath(oldpath, self._workdir_str)
+        new_rel = os.path.relpath(newpath, self._workdir_str)
+        # Ensure source is in upper (COW copy)
+        old_upper = self._branch.ensure_cow_copy(old_rel)
+        new_upper = self._branch.upper_dir / new_rel
+        new_upper.parent.mkdir(parents=True, exist_ok=True)
+        os.link(str(old_upper), str(new_upper))
+        return True
+
+    def handle_chmod(self, path: str, mode: int) -> bool:
+        """Handle chmod/fchmodat: chmod in upper (COW copy if needed)."""
+        rel_path = os.path.relpath(path, self._workdir_str)
+        upper_file = self._branch.ensure_cow_copy(rel_path)
+        os.chmod(str(upper_file), mode)
+        return True
+
+    def handle_readlink(self, path: str) -> str | None:
+        """Handle readlink: resolve symlink from upper or lower.
+
+        Returns the link target, or None if not a symlink.
+        """
+        rel_path = os.path.relpath(path, self._workdir_str)
+        upper_file = self._branch.upper_dir / rel_path
+        lower_file = Path(self._workdir_str) / rel_path
+
+        if upper_file.is_symlink():
+            return os.readlink(str(upper_file))
+        if lower_file.is_symlink():
+            return os.readlink(str(lower_file))
+        return None
+
+    def handle_truncate(self, path: str, length: int) -> bool:
+        """Handle truncate: truncate in upper (COW copy if needed)."""
+        rel_path = os.path.relpath(path, self._workdir_str)
+        upper_file = self._branch.ensure_cow_copy(rel_path)
+        os.truncate(str(upper_file), length)
+        return True
+
     @property
     def upper_dir(self) -> Path:
         return self._branch.upper_dir
