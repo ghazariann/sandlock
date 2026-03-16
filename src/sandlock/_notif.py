@@ -614,7 +614,11 @@ class NotifSupervisor:
             except OSError:
                 target = ""
             if self._cow_handler.matches(target):
-                self._handle_cow_getdents(notif, target)
+                from .cowfs._notif_handler import handle_cow_getdents
+                handle_cow_getdents(notif, target, self._cow_handler,
+                                    self._proc_dir_cache, self._id_valid,
+                                    self._respond_val, self._respond_continue,
+                                    _build_dirent64)
                 return
 
         if nr in (nr_getdents64, nr_getdents) and self._policy.isolate_pids:
@@ -796,7 +800,10 @@ class NotifSupervisor:
                         if real_path is None:
                             self._respond_errno(notif.id, errno.ENOENT)
                         else:
-                            self._handle_cow_stat(notif, nr, real_path)
+                            from .cowfs._notif_handler import handle_cow_stat
+                            handle_cow_stat(notif, nr, real_path,
+                                            self._id_valid, self._respond_val,
+                                            self._respond_errno, self._respond_continue)
                         return
 
                     # statx — complex struct, let kernel handle if possible
@@ -830,7 +837,10 @@ class NotifSupervisor:
                     if nr in (nr_readlinkat, nr_readlink):
                         target = self._cow_handler.handle_readlink(path)
                         if target is not None:
-                            self._handle_cow_readlink(notif, nr, target)
+                            from .cowfs._notif_handler import handle_cow_readlink
+                            handle_cow_readlink(notif, nr, target,
+                                                self._id_valid, self._respond_val,
+                                                self._respond_continue)
                         else:
                             self._respond_errno(notif.id, errno.EINVAL)
                         return
@@ -871,7 +881,9 @@ class NotifSupervisor:
             if is_read_only and not self._cow_handler._branch.has_changes:
                 self._respond_continue(notif.id)
                 return
-            self._handle_cow_open(notif, path, flags)
+            from .cowfs._notif_handler import handle_cow_open
+            handle_cow_open(notif, path, flags, self._cow_handler,
+                            self._respond_continue, self._respond_addfd)
             return
 
         # Virtualize /proc/net/* to hide host and other sandboxes' info
@@ -906,24 +918,7 @@ class NotifSupervisor:
         elif action == NotifAction.VIRTUALIZE:
             self._respond_virtualize(notif.id, virtual_content)
 
-    def _handle_cow_open(self, notif: SeccompNotif, path: str, flags: int) -> None:
-        """Handle openat under workdir: redirect to COW upper dir."""
-        real_path = self._cow_handler.handle_open(path, flags)
-        if real_path is None:
-            self._respond_continue(notif.id)
-            return
-
-        # Open the file in the supervisor and inject fd into child
-        try:
-            fd = os.open(real_path, flags, 0o666)
-        except OSError:
-            self._respond_continue(notif.id)
-            return
-
-        try:
-            self._respond_addfd(notif.id, fd)
-        finally:
-            os.close(fd)
+    # COW handlers moved to cowfs/_notif_handler.py
 
     def _respond_addfd(self, notif_id: int, src_fd: int) -> None:
         """Inject an open fd into the child and return it as the syscall result."""
@@ -1048,152 +1043,7 @@ class NotifSupervisor:
         # Fallback: let the syscall proceed normally
         self._respond_continue(notif.id)
 
-    def _handle_cow_stat(self, notif: SeccompNotif, nr: int, real_path: str) -> None:
-        """Do stat on the resolved COW path, write result to child's buffer."""
-        from ._procfs import write_bytes
-
-        nr_newfstatat = _SYSCALL_NR.get("newfstatat")
-        nr_stat = _SYSCALL_NR.get("stat")
-        nr_lstat = _SYSCALL_NR.get("lstat")
-
-        # Get the statbuf pointer from syscall args
-        if nr == nr_newfstatat:
-            # newfstatat(dirfd, pathname, statbuf, flags)
-            statbuf_addr = notif.data.args[2]
-            use_lstat = bool(notif.data.args[3] & 0x100)  # AT_SYMLINK_NOFOLLOW
-        elif nr == nr_stat:
-            # stat(pathname, statbuf)
-            statbuf_addr = notif.data.args[1]
-            use_lstat = False
-        elif nr == nr_lstat:
-            # lstat(pathname, statbuf)
-            statbuf_addr = notif.data.args[1]
-            use_lstat = True
-        else:
-            self._respond_continue(notif.id)
-            return
-
-        try:
-            if use_lstat:
-                st = os.lstat(real_path)
-            else:
-                st = os.stat(real_path)
-        except OSError:
-            self._respond_errno(notif.id, errno.ENOENT)
-            return
-
-        # Pack struct stat (x86_64: 144 bytes)
-        # dev(Q) ino(Q) nlink(Q) mode(I) uid(I) gid(I) pad(I) rdev(Q)
-        # size(q) blksize(q) blocks(q)
-        # atime_sec(Q) atime_ns(Q) mtime_sec(Q) mtime_ns(Q)
-        # ctime_sec(Q) ctime_ns(Q) unused(qqq)
-        packed = struct.pack(
-            "QQQIIIIQqqqQQQQQQqqq",
-            st.st_dev, st.st_ino, st.st_nlink,
-            st.st_mode, st.st_uid, st.st_gid, 0,  # pad
-            st.st_rdev,
-            st.st_size, st.st_blksize, st.st_blocks,
-            int(st.st_atime), int(st.st_atime_ns % 1_000_000_000),
-            int(st.st_mtime), int(st.st_mtime_ns % 1_000_000_000),
-            int(st.st_ctime), int(st.st_ctime_ns % 1_000_000_000),
-            0, 0, 0,  # unused
-        )
-
-        if not self._id_valid(notif.id):
-            return
-
-        try:
-            write_bytes(notif.pid, statbuf_addr, packed)
-            self._respond_val(notif.id, 0)
-        except OSError:
-            self._respond_continue(notif.id)
-
-    def _handle_cow_readlink(self, notif: SeccompNotif, nr: int, target: str) -> None:
-        """Write readlink result to child's buffer."""
-        from ._procfs import write_bytes
-
-        nr_readlinkat = _SYSCALL_NR.get("readlinkat")
-
-        if nr == nr_readlinkat:
-            # readlinkat(dirfd, pathname, buf, bufsiz)
-            buf_addr = notif.data.args[2]
-            bufsiz = notif.data.args[3] & 0xFFFFFFFF
-        else:
-            # readlink(pathname, buf, bufsiz)
-            buf_addr = notif.data.args[1]
-            bufsiz = notif.data.args[2] & 0xFFFFFFFF
-
-        target_bytes = target.encode()
-        write_len = min(len(target_bytes), bufsiz)
-
-        if not self._id_valid(notif.id):
-            return
-
-        try:
-            write_bytes(notif.pid, buf_addr, target_bytes[:write_len])
-            self._respond_val(notif.id, write_len)
-        except OSError:
-            self._respond_continue(notif.id)
-
-    def _handle_cow_getdents(self, notif: SeccompNotif, dir_path: str) -> None:
-        """Handle getdents64 for COW directories — merge upper + lower entries."""
-        pid = notif.pid
-        child_fd_num = notif.data.args[0] & 0xFFFFFFFF
-        buf_addr = notif.data.args[1]
-        buf_size = notif.data.args[2] & 0xFFFFFFFF
-
-        cache_key = ("cow", pid, child_fd_num)
-        if cache_key not in self._proc_dir_cache:
-            workdir = self._cow_handler.workdir
-            rel_path = os.path.relpath(dir_path, workdir)
-            merged_names = self._cow_handler.list_merged_dir(rel_path)
-
-            DT_DIR = 4
-            DT_REG = 8
-            DT_LNK = 10
-            entries = []
-            d_off = 0
-            for name in merged_names:
-                d_off += 1
-                # Determine type from upper or lower
-                upper_p = self._cow_handler.upper_dir / rel_path / name
-                lower_p = Path(workdir) / rel_path / name
-                check = upper_p if upper_p.exists() else lower_p
-                if check.is_dir():
-                    d_type = DT_DIR
-                elif check.is_symlink():
-                    d_type = DT_LNK
-                else:
-                    d_type = DT_REG
-                entries.append(_build_dirent64(d_off, d_off, d_type, name))
-
-            self._proc_dir_cache[cache_key] = entries
-
-        entries = self._proc_dir_cache[cache_key]
-
-        if not self._id_valid(notif.id):
-            return
-
-        result = bytearray()
-        consumed = 0
-        for entry in entries:
-            if len(result) + len(entry) > buf_size:
-                break
-            result.extend(entry)
-            consumed += 1
-
-        if consumed > 0:
-            self._proc_dir_cache[cache_key] = entries[consumed:]
-        elif not entries:
-            del self._proc_dir_cache[cache_key]
-
-        try:
-            if result:
-                write_bytes(pid, buf_addr, bytes(result))
-            self._respond_val(notif.id, len(result))
-        except OSError:
-            self._proc_dir_cache.pop(cache_key, None)
-            self._respond_continue(notif.id)
+    # COW stat, readlink, getdents handlers moved to cowfs/_notif_handler.py
 
     def _handle_getdents(self, notif: SeccompNotif) -> None:
         """Handle getdents64/getdents — filter /proc readdir to hide foreign PIDs.
