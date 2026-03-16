@@ -863,6 +863,28 @@ class TestStrictMode:
 
 # --- OverlayFS COW isolation ---
 
+def _overlayfs_available() -> bool:
+    """Check if unprivileged overlayfs (user+mount namespace) works."""
+    td = tempfile.mkdtemp()
+    try:
+        policy = Policy(
+            workdir=td,
+            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", "/tmp"],
+            fs_writable=["/tmp", td],
+        )
+        result = Sandbox(policy).run(["echo", "ok"])
+        return result.success and result.stdout.strip() == b"ok"
+    except Exception:
+        return False
+    finally:
+        import shutil
+        shutil.rmtree(td, ignore_errors=True)
+
+
+@pytest.mark.skipif(
+    not _overlayfs_available(),
+    reason="Unprivileged overlayfs not available (needs kernel 5.11+ with user namespaces)",
+)
 class TestOverlayFS:
     def test_workdir_enables_cow(self):
         """Setting workdir auto-enables overlayfs COW."""
