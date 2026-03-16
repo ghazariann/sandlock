@@ -114,7 +114,7 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
             "newfstatat", "statx", "faccessat",
             "getdents64",
             # Non-at variants (x86_64 has both, aarch64 only has *at)
-            "unlink", "mkdir", "rename",
+            "unlink", "rmdir", "mkdir", "rename",
             "stat", "lstat", "access",
         ]
         for name in cow_syscalls:

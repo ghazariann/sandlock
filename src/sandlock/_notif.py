@@ -669,6 +669,7 @@ class NotifSupervisor:
         if self._cow_handler is not None:
             nr_unlinkat = _SYSCALL_NR.get("unlinkat")
             nr_unlink = _SYSCALL_NR.get("unlink")
+            nr_rmdir = _SYSCALL_NR.get("rmdir")
             nr_mkdirat = _SYSCALL_NR.get("mkdirat")
             nr_mkdir = _SYSCALL_NR.get("mkdir")
             nr_renameat2 = _SYSCALL_NR.get("renameat2")
@@ -684,7 +685,7 @@ class NotifSupervisor:
             cow_at_nrs = {nr_unlinkat, nr_mkdirat, nr_renameat2,
                           nr_newfstatat, nr_statx, nr_faccessat} - {None}
             # non-at variants: pathname=arg0
-            cow_plain_nrs = {nr_unlink, nr_mkdir, nr_rename,
+            cow_plain_nrs = {nr_unlink, nr_rmdir, nr_mkdir, nr_rename,
                              nr_stat, nr_lstat, nr_access} - {None}
 
             if nr in cow_at_nrs or nr in cow_plain_nrs:
@@ -704,9 +705,12 @@ class NotifSupervisor:
                     return
 
                 if self._cow_handler.matches(path):
-                    # unlink / unlinkat
-                    if nr in (nr_unlinkat, nr_unlink):
-                        if self._cow_handler.handle_unlink(path):
+                    # unlink / unlinkat / rmdir
+                    if nr in (nr_unlinkat, nr_unlink, nr_rmdir):
+                        is_dir = (nr == nr_rmdir or
+                                  (nr == nr_unlinkat and
+                                   bool(notif.data.args[2] & 0x200)))
+                        if self._cow_handler.handle_unlink(path, is_dir=is_dir):
                             self._respond_val(notif.id, 0)
                         else:
                             self._respond_continue(notif.id)

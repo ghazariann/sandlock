@@ -54,6 +54,14 @@ O_APPEND = 0o2000
 _WRITE_FLAGS = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND
 
 
+def _whiteout_path(upper_dir: Path, rel_path: str) -> Path:
+    """Return the whiteout marker path for a deleted file.
+
+    Whiteout is stored as a sibling: upper/<dirname>/.wh.<basename>
+    """
+    return upper_dir / os.path.dirname(rel_path) / f".wh.{os.path.basename(rel_path)}"
+
+
 class CowBranch(CowBranchBase):
     """Seccomp notif-based COW. No namespaces, no dependencies."""
 
@@ -126,7 +134,35 @@ class CowBranch(CowBranchBase):
             return
         if self._branch_id is None:
             raise BranchError("Branch not created yet")
-        merge_upper_to_target(self.upper_dir, self._workdir)
+
+        upper = self.upper_dir
+        target = self._workdir
+
+        # Process whiteouts first — delete corresponding target files
+        for root, dirs, files in os.walk(upper):
+            rel = os.path.relpath(root, upper)
+            for f in files:
+                if f.startswith(".wh."):
+                    original_name = f[4:]
+                    dest = target / rel / original_name
+                    if dest.is_dir():
+                        shutil.rmtree(str(dest), ignore_errors=True)
+                    elif dest.exists():
+                        dest.unlink()
+
+        # Copy non-whiteout files from upper to target
+        for root, dirs, files in os.walk(upper):
+            rel = os.path.relpath(root, upper)
+            for d in dirs:
+                dest = target / rel / d
+                dest.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                if not f.startswith(".wh."):
+                    src = Path(root) / f
+                    dest = target / rel / f
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src), str(dest))
+
         cleanup_branch_dir(self._storage, self._branch_id)
         self._finished = True
 
@@ -192,10 +228,14 @@ class CowHandler:
                 return str(resolved)
             return None
 
-    def handle_unlink(self, path: str) -> bool:
-        """Handle unlinkat: delete from upper, create whiteout.
+    def handle_unlink(self, path: str, is_dir: bool = False) -> bool:
+        """Handle unlink/rmdir: delete from upper, create whiteout.
 
-        Returns True if handled (respond errno 0), False to continue.
+        Args:
+            path: Absolute path to delete.
+            is_dir: True for rmdir (AT_REMOVEDIR), False for unlink.
+
+        Returns True if handled (respond 0), False to let kernel handle.
         """
         rel_path = os.path.relpath(path, self._workdir_str)
         upper_file = self._branch.upper_dir / rel_path
@@ -203,14 +243,15 @@ class CowHandler:
 
         # Delete from upper if exists
         if upper_file.exists():
-            upper_file.unlink()
+            if is_dir and upper_file.is_dir():
+                shutil.rmtree(str(upper_file), ignore_errors=True)
+            elif not is_dir:
+                upper_file.unlink()
 
-        # If file exists in lower, create a whiteout marker
-        if lower_file.exists():
-            upper_file.parent.mkdir(parents=True, exist_ok=True)
-            # Use an empty file as whiteout marker (not a char device,
-            # since we can't create those without root)
-            whiteout = self._branch.upper_dir / f".wh.{rel_path}"
+        # If exists in lower, create whiteout marker as sibling:
+        # upper/<dirname>/.wh.<basename>
+        if lower_file.exists() or lower_file.is_symlink():
+            whiteout = _whiteout_path(self._branch.upper_dir, rel_path)
             whiteout.parent.mkdir(parents=True, exist_ok=True)
             whiteout.touch()
             return True
@@ -231,14 +272,13 @@ class CowHandler:
     def handle_stat(self, path: str) -> str | None:
         """Handle newfstatat/statx: resolve to upper or lower path.
 
-        Returns the real path to stat, or None to continue.
+        Returns the real path to stat, or None if deleted/nonexistent.
         """
         rel_path = os.path.relpath(path, self._workdir_str)
 
         # Check for whiteout (deleted file)
-        whiteout = self._branch.upper_dir / f".wh.{rel_path}"
-        if whiteout.exists():
-            return None  # file was deleted — kernel returns ENOENT
+        if _whiteout_path(self._branch.upper_dir, rel_path).exists():
+            return None
 
         resolved = self._branch.resolve_read(rel_path)
         if resolved.exists():
@@ -268,11 +308,10 @@ class CowHandler:
         entries = set()
         whiteouts = set()
 
-        # Collect whiteouts — stored as .wh.<name> in the upper dir
-        # For rel_path ".", whiteouts are .wh.<name> in upper root
-        wh_search = self._branch.upper_dir if rel_path == "." else upper_dir
-        if wh_search.is_dir():
-            for e in wh_search.iterdir():
+        # Collect whiteouts — stored as .wh.<name> as siblings in upper dir
+        scan_dir = self._branch.upper_dir / rel_path if rel_path != "." else self._branch.upper_dir
+        if scan_dir.is_dir():
+            for e in scan_dir.iterdir():
                 if e.name.startswith(".wh."):
                     whiteouts.add(e.name[4:])  # strip ".wh." prefix
 
@@ -282,7 +321,7 @@ class CowHandler:
                 if not e.name.startswith(".wh."):
                     entries.add(e.name)
 
-        # Lower entries (not whited out, not already in upper)
+        # Lower entries (not whited out)
         if lower_dir.is_dir():
             for e in lower_dir.iterdir():
                 if e.name not in whiteouts:
