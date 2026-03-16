@@ -74,15 +74,13 @@ class CowFS:
 
     def exists(self, path: str) -> bool:
         """Check if a file or directory exists (upper or lower)."""
-        from ._branch import _whiteout_path
-        if _whiteout_path(self._branch.upper_dir, path).exists():
+        if self._branch.is_deleted(path):
             return False
         return self._branch.resolve_read(path).exists()
 
     def stat(self, path: str) -> os.stat_result:
         """Stat a file (checks upper first, then lower)."""
-        from ._branch import _whiteout_path
-        if _whiteout_path(self._branch.upper_dir, path).exists():
+        if self._branch.is_deleted(path):
             raise FileNotFoundError(path)
         resolved = self._branch.resolve_read(path)
         return os.stat(str(resolved))

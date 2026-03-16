@@ -12,22 +12,18 @@ from ..exceptions import BranchError
 from .._cow_base import CowBranchBase, cleanup_branch_dir
 
 
-def _whiteout_path(upper_dir: Path, rel_path: str) -> Path:
-    """Return the whiteout marker path for a deleted file.
-
-    Whiteout is stored as a sibling: upper/<dirname>/.wh.<basename>
-    """
-    return upper_dir / os.path.dirname(rel_path) / f".wh.{os.path.basename(rel_path)}"
-
-
 class CowBranch(CowBranchBase):
-    """Seccomp notif-based COW. No namespaces, no dependencies."""
+    """Seccomp notif-based COW. No namespaces, no dependencies.
+
+    Tracks deletions in memory (no whiteout files on disk).
+    """
 
     def __init__(self, workdir: Path, storage: Path | None = None):
         self._workdir = Path(workdir)
         self._storage = storage or Path(f"/tmp/sandlock-cow-{os.getpid()}")
         self._branch_id: str | None = None
         self._finished = False
+        self._deleted: set[str] = set()  # relative paths deleted by sandbox
 
     @property
     def workdir(self) -> Path:
@@ -60,12 +56,23 @@ class CowBranch(CowBranchBase):
         (branch_dir / "upper").mkdir(exist_ok=True)
         return self._workdir
 
+    def is_deleted(self, rel_path: str) -> bool:
+        """Check if a path has been deleted in this branch."""
+        return rel_path in self._deleted
+
+    def mark_deleted(self, rel_path: str) -> None:
+        """Mark a path as deleted."""
+        self._deleted.add(rel_path)
+
     def ensure_cow_copy(self, rel_path: str) -> Path:
         """Ensure a COW copy exists in upper. Returns the upper path.
 
         If the file exists in lower (workdir) but not in upper, copies it.
         If it exists in neither, returns the upper path (for new files).
+        Clears any deletion mark for this path.
         """
+        self._deleted.discard(rel_path)
+
         upper_file = self.upper_dir / rel_path
         lower_file = self._workdir / rel_path
 
@@ -96,30 +103,25 @@ class CowBranch(CowBranchBase):
         upper = self.upper_dir
         target = self._workdir
 
-        # Process whiteouts first — delete corresponding target files
-        for root, dirs, files in os.walk(upper):
-            rel = os.path.relpath(root, upper)
-            for f in files:
-                if f.startswith(".wh."):
-                    original_name = f[4:]
-                    dest = target / rel / original_name
-                    if dest.is_dir():
-                        shutil.rmtree(str(dest), ignore_errors=True)
-                    elif dest.exists():
-                        dest.unlink()
+        # Delete files marked as deleted
+        for rel_path in self._deleted:
+            dest = target / rel_path
+            if dest.is_dir():
+                shutil.rmtree(str(dest), ignore_errors=True)
+            elif dest.exists() or dest.is_symlink():
+                dest.unlink()
 
-        # Copy non-whiteout files from upper to target
+        # Copy files from upper to target
         for root, dirs, files in os.walk(upper):
             rel = os.path.relpath(root, upper)
             for d in dirs:
                 dest = target / rel / d
                 dest.mkdir(parents=True, exist_ok=True)
             for f in files:
-                if not f.startswith(".wh."):
-                    src = Path(root) / f
-                    dest = target / rel / f
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(src), str(dest))
+                src = Path(root) / f
+                dest = target / rel / f
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest))
 
         cleanup_branch_dir(self._storage, self._branch_id)
         self._finished = True

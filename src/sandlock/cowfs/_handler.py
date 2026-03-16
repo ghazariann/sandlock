@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CowHandler: seccomp notif decision logic for COW interception.
 
-Stateless — all state lives in CowBranch. This class provides the
-decision logic that the seccomp notif supervisor calls for each
-intercepted filesystem syscall.
+Stateless — all state lives in CowBranch (including the deleted set).
+This class provides the decision logic that the seccomp notif supervisor
+calls for each intercepted filesystem syscall.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import os
 import shutil
 from pathlib import Path
 
-from ._branch import CowBranch, _whiteout_path
+from ._branch import CowBranch
 
 # O_* flags for detecting writes
 O_WRONLY = 0o1
@@ -26,11 +26,7 @@ _WRITE_FLAGS = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND
 
 
 class CowHandler:
-    """Handles seccomp notif syscall interception for COW.
-
-    Each handle_* method returns either a result (for the supervisor
-    to respond with) or None (to let the kernel handle it).
-    """
+    """Handles seccomp notif syscall interception for COW."""
 
     def __init__(self, branch: CowBranch):
         self._branch = branch
@@ -57,12 +53,18 @@ class CowHandler:
             return None
 
         rel_path = os.path.relpath(path, self._workdir_str)
+
+        # Deleted file — new create or ENOENT
+        if self._branch.is_deleted(rel_path):
+            if flags & O_CREAT:
+                return str(self._branch.ensure_cow_copy(rel_path))
+            return None
+
         is_write = bool(flags & _WRITE_FLAGS)
 
         if is_write:
             try:
-                upper_file = self._branch.ensure_cow_copy(rel_path)
-                return str(upper_file)
+                return str(self._branch.ensure_cow_copy(rel_path))
             except OSError:
                 return None
         else:
@@ -72,7 +74,7 @@ class CowHandler:
             return None
 
     def handle_unlink(self, path: str, is_dir: bool = False) -> bool:
-        """Handle unlink/rmdir: delete from upper, create whiteout.
+        """Handle unlink/rmdir: delete from upper, mark as deleted.
 
         Returns True if handled, False to let kernel handle.
         """
@@ -80,16 +82,20 @@ class CowHandler:
         upper_file = self._branch.upper_dir / rel_path
         lower_file = Path(self._workdir_str) / rel_path
 
+        # Delete from upper if exists
         if upper_file.exists():
             if is_dir and upper_file.is_dir():
                 shutil.rmtree(str(upper_file), ignore_errors=True)
             elif not is_dir:
                 upper_file.unlink()
 
+        # Mark as deleted if it exists in lower
         if lower_file.exists() or lower_file.is_symlink():
-            whiteout = _whiteout_path(self._branch.upper_dir, rel_path)
-            whiteout.parent.mkdir(parents=True, exist_ok=True)
-            whiteout.touch()
+            self._branch.mark_deleted(rel_path)
+            return True
+
+        # Existed only in upper (already deleted above)
+        if not lower_file.exists():
             return True
 
         return False
@@ -97,6 +103,7 @@ class CowHandler:
     def handle_mkdir(self, path: str, mode: int) -> bool:
         """Handle mkdirat: create directory in upper."""
         rel_path = os.path.relpath(path, self._workdir_str)
+        self._branch._deleted.discard(rel_path)
         upper_dir = self._branch.upper_dir / rel_path
         upper_dir.mkdir(parents=True, exist_ok=True)
         return True
@@ -108,7 +115,7 @@ class CowHandler:
         """
         rel_path = os.path.relpath(path, self._workdir_str)
 
-        if _whiteout_path(self._branch.upper_dir, rel_path).exists():
+        if self._branch.is_deleted(rel_path):
             return None
 
         resolved = self._branch.resolve_read(rel_path)
@@ -125,30 +132,31 @@ class CowHandler:
         new_upper = self._branch.upper_dir / new_rel
         new_upper.parent.mkdir(parents=True, exist_ok=True)
         old_upper.rename(new_upper)
+
+        # Old path is effectively deleted from lower
+        lower_old = Path(self._workdir_str) / old_rel
+        if lower_old.exists():
+            self._branch.mark_deleted(old_rel)
+
         return True
 
     def list_merged_dir(self, rel_path: str) -> list[str]:
-        """List directory entries merging upper + lower, minus whiteouts."""
+        """List directory entries merging upper + lower, minus deletions."""
         lower_dir = Path(self._workdir_str) / rel_path
         upper_dir = self._branch.upper_dir / rel_path
 
         entries = set()
-        whiteouts = set()
 
-        scan_dir = self._branch.upper_dir / rel_path if rel_path != "." else self._branch.upper_dir
-        if scan_dir.is_dir():
-            for e in scan_dir.iterdir():
-                if e.name.startswith(".wh."):
-                    whiteouts.add(e.name[4:])
-
+        # Upper entries
         if upper_dir.is_dir():
             for e in upper_dir.iterdir():
-                if not e.name.startswith(".wh."):
-                    entries.add(e.name)
+                entries.add(e.name)
 
+        # Lower entries (not deleted)
         if lower_dir.is_dir():
             for e in lower_dir.iterdir():
-                if e.name not in whiteouts:
+                child_rel = os.path.join(rel_path, e.name) if rel_path != "." else e.name
+                if not self._branch.is_deleted(child_rel):
                     entries.add(e.name)
 
         return sorted(entries)
@@ -156,6 +164,7 @@ class CowHandler:
     def handle_symlink(self, target: str, linkpath: str) -> bool:
         """Handle symlink: create symlink in upper."""
         rel_path = os.path.relpath(linkpath, self._workdir_str)
+        self._branch._deleted.discard(rel_path)
         upper_link = self._branch.upper_dir / rel_path
         upper_link.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, str(upper_link))
@@ -181,6 +190,10 @@ class CowHandler:
     def handle_readlink(self, path: str) -> str | None:
         """Handle readlink: resolve symlink from upper or lower."""
         rel_path = os.path.relpath(path, self._workdir_str)
+
+        if self._branch.is_deleted(rel_path):
+            return None
+
         upper_file = self._branch.upper_dir / rel_path
         lower_file = Path(self._workdir_str) / rel_path
 
