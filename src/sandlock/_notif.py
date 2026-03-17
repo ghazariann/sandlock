@@ -938,6 +938,76 @@ class NotifSupervisor:
                 self._respond_continue(notif.id)
                 return
 
+        # --- COW: execve / execveat path redirection ---
+        if self._cow_handler is not None:
+            nr_execve = _SYSCALL_NR.get("execve")
+            nr_execveat = _SYSCALL_NR.get("execveat")
+
+            if nr in (nr_execve, nr_execveat):
+                try:
+                    if nr == nr_execve:
+                        # execve(pathname, argv, envp)
+                        pathname_addr = notif.data.args[0]
+                        path = resolve_openat_path(pid, -100, pathname_addr)
+                    else:
+                        # execveat(dirfd, pathname, argv, envp, flags)
+                        dirfd = ctypes.c_int32(notif.data.args[0] & 0xFFFFFFFF).value
+                        exec_flags = notif.data.args[4]
+                        if exec_flags & 0x1000:  # AT_EMPTY_PATH — fd-based, no path
+                            self._respond_continue(notif.id)
+                            return
+                        pathname_addr = notif.data.args[1]
+                        path = resolve_openat_path(pid, dirfd, pathname_addr)
+                except OSError:
+                    self._respond_continue(notif.id)
+                    return
+
+                if not self._id_valid(notif.id):
+                    return
+
+                if not self._cow_handler.matches(path):
+                    self._respond_continue(notif.id)
+                    return
+
+                # Resolve through COW layer
+                real_path = self._cow_handler.handle_stat(path)
+                if real_path is None:
+                    # File deleted in COW
+                    self._respond_errno(notif.id, errno.ENOENT)
+                    return
+
+                # If unchanged (real_path == path), let kernel handle it
+                if real_path == path:
+                    self._respond_continue(notif.id)
+                    return
+
+                # File is in upper layer — inject fd then rewrite path
+                try:
+                    src_fd = os.open(real_path, os.O_RDONLY | os.O_CLOEXEC)
+                except OSError:
+                    self._respond_continue(notif.id)
+                    return
+
+                try:
+                    child_fd = self._inject_fd(notif.id, src_fd, cloexec=False)
+                finally:
+                    os.close(src_fd)
+
+                if child_fd < 0:
+                    self._respond_continue(notif.id)
+                    return
+
+                # Overwrite the pathname in child memory with /proc/self/fd/N
+                proc_path = f"/proc/self/fd/{child_fd}\0".encode()
+                try:
+                    write_bytes(pid, pathname_addr, proc_path)
+                except OSError:
+                    self._respond_continue(notif.id)
+                    return
+
+                self._respond_continue(notif.id)
+                return
+
         # --- Filesystem: open / openat virtualization + COW ---
         nr_openat = _SYSCALL_NR.get("openat")
         nr_open = _SYSCALL_NR.get("open")
@@ -1049,6 +1119,26 @@ class NotifSupervisor:
             ctypes.c_ulong(SECCOMP_IOCTL_NOTIF_SEND),
             ctypes.byref(resp),
         )
+
+    def _inject_fd(self, notif_id: int, src_fd: int,
+                   cloexec: bool = False) -> int:
+        """Inject an fd into the child without completing the notification.
+
+        Returns the fd number in the child's table, or -1 on failure.
+        """
+        addfd = SeccompNotifAddfd()
+        addfd.id = notif_id
+        addfd.flags = 0  # Don't auto-send response
+        addfd.srcfd = src_fd
+        addfd.newfd = 0
+        addfd.newfd_flags = os.O_CLOEXEC if cloexec else 0
+
+        ret = _libc.ioctl(
+            ctypes.c_int(self._notify_fd),
+            ctypes.c_ulong(SECCOMP_IOCTL_NOTIF_ADDFD),
+            ctypes.byref(addfd),
+        )
+        return ret
 
     # Network, memory, and fork handlers moved to _network.py and _resource.py
 

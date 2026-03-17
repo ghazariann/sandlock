@@ -1065,6 +1065,51 @@ class TestCOW:
             assert result.success
             assert b"orig=51200" in result.stdout
 
+    def test_cow_execve_runs_upper_binary(self, isolation):
+        """execve on a binary created in COW upper layer should work."""
+        import subprocess as sp
+
+        def create_and_exec():
+            with open('hello.sh', 'w') as f:
+                f.write('#!/bin/sh\necho HELLO_FROM_COW\n')
+            os.chmod('hello.sh', 0o755)
+            return sp.check_output(['./hello.sh']).decode().strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
+                on_exit=BranchAction.ABORT,
+            )
+            result = Sandbox(policy).call(create_and_exec)
+            assert result.success, f"Failed: {result.error}"
+            assert result.value == "HELLO_FROM_COW"
+            assert not os.path.exists(f"{td}/project/hello.sh")
+
+    def test_cow_execve_modified_binary(self, isolation):
+        """execve on a binary modified in COW upper layer runs the new version."""
+        import subprocess as sp
+
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            with open(f"{td}/project/run.sh", "w") as f:
+                f.write("#!/bin/sh\necho ORIGINAL\n")
+            os.chmod(f"{td}/project/run.sh", 0o755)
+
+            def modify_and_exec():
+                with open('run.sh', 'w') as f:
+                    f.write('#!/bin/sh\necho MODIFIED\n')
+                return sp.check_output(['./run.sh']).decode().strip()
+
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
+                on_exit=BranchAction.ABORT,
+            )
+            result = Sandbox(policy).call(modify_and_exec)
+            assert result.success, f"Failed: {result.error}"
+            assert result.value == "MODIFIED"
+            assert open(f"{td}/project/run.sh").read() == "#!/bin/sh\necho ORIGINAL\n"
+
     def test_cow_chown_goes_to_upper(self, isolation):
         """chown on a COW file operates on the upper copy, not the original."""
         with tempfile.TemporaryDirectory() as td:
