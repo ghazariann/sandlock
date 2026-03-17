@@ -68,6 +68,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cli_kwargs["isolate_signals"] = True
     if args.port_remap:
         cli_kwargs["port_remap"] = True
+    if args.random_seed is not None:
+        cli_kwargs["random_seed"] = args.random_seed
     if args.clean_env:
         cli_kwargs["clean_env"] = True
     if args.env:
@@ -379,6 +381,8 @@ def main() -> None:
                        help="Block signals to processes outside sandbox (Landlock ABI v6+)")
     run_p.add_argument("--port-remap", action="store_true",
                        help="Transparent TCP port remapping (no port conflicts between sandboxes)")
+    run_p.add_argument("--random-seed", type=int, metavar="SEED",
+                       help="Deterministic randomness (getrandom returns seeded PRNG)")
     run_p.add_argument("--clean-env", action="store_true",
                        help="Start with minimal environment (PATH, HOME, USER, TERM, LANG)")
     run_p.add_argument("--env", action="append", metavar="KEY=VALUE",

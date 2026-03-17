@@ -124,6 +124,8 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
                 names.append(name)
         if "getdents" in _SYSCALL_NR:
             names.append("getdents")
+    if notif is not None and notif.random_seed is not None:
+        names.append("getrandom")
     # Deduplicate (clone/open may already be in the list)
     return list(dict.fromkeys(names))
 

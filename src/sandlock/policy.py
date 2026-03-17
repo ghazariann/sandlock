@@ -162,6 +162,11 @@ class Policy:
     real port.  Inbound traffic to the virtual port is proxied to the
     real port automatically.  No network namespaces or root required."""
 
+    # Deterministic execution
+    random_seed: int | None = None
+    """Seed for deterministic randomness. When set, getrandom() returns
+    deterministic bytes from a seeded PRNG. Same seed = same output."""
+
     # Optional chroot
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""

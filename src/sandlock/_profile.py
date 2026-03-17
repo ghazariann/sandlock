@@ -46,6 +46,8 @@ _SIMPLE_FIELDS: dict[str, type] = {
     # Environment
     "clean_env": bool,
     "env": dict,
+    # Deterministic
+    "random_seed": int,
     # Misc
     "port_remap": bool,
     "close_fds": bool,

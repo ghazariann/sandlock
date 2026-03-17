@@ -1028,3 +1028,86 @@ class TestCOW:
             )
             assert result.success
             assert b"orig=51200" in result.stdout
+
+
+# --- Deterministic randomness ---
+
+class TestDeterministicRandom:
+    def test_getrandom_deterministic(self):
+        """Same random_seed produces same os.urandom() output."""
+        policy = Policy(random_seed=42)
+        r1 = Sandbox(policy).run(
+            ["python3", "-c", "import os; print(os.urandom(16).hex())"]
+        )
+        r2 = Sandbox(policy).run(
+            ["python3", "-c", "import os; print(os.urandom(16).hex())"]
+        )
+        assert r1.success and r2.success
+        assert r1.stdout == r2.stdout
+
+    def test_different_seeds_differ(self):
+        """Different seeds produce different output."""
+        r1 = Sandbox(Policy(random_seed=42)).run(
+            ["python3", "-c", "import os; print(os.urandom(16).hex())"]
+        )
+        r2 = Sandbox(Policy(random_seed=99)).run(
+            ["python3", "-c", "import os; print(os.urandom(16).hex())"]
+        )
+        assert r1.success and r2.success
+        assert r1.stdout != r2.stdout
+
+    def test_no_seed_is_nondeterministic(self):
+        """Without random_seed, os.urandom() is real randomness."""
+        r1 = Sandbox(Policy()).run(
+            ["python3", "-c", "import os; print(os.urandom(16).hex())"]
+        )
+        r2 = Sandbox(Policy()).run(
+            ["python3", "-c", "import os; print(os.urandom(16).hex())"]
+        )
+        assert r1.success and r2.success
+        assert r1.stdout != r2.stdout
+
+    def test_dev_urandom_deterministic(self):
+        """/dev/urandom reads are deterministic with same seed."""
+        policy = Policy(random_seed=42)
+        r1 = Sandbox(policy).run(
+            ["python3", "-c",
+             "print(open('/dev/urandom','rb').read(16).hex())"]
+        )
+        r2 = Sandbox(policy).run(
+            ["python3", "-c",
+             "print(open('/dev/urandom','rb').read(16).hex())"]
+        )
+        assert r1.success and r2.success
+        assert r1.stdout == r2.stdout
+
+    def test_dev_urandom_multiple_reads(self):
+        """/dev/urandom supports multiple reads (pipe-backed, no EOF)."""
+        policy = Policy(random_seed=42)
+        result = Sandbox(policy).run(
+            ["python3", "-c",
+             "f=open('/dev/urandom','rb')\n"
+             "a=f.read(8).hex()\n"
+             "b=f.read(8).hex()\n"
+             "f.close()\n"
+             "print(f'{a} {b}')"]
+        )
+        assert result.success
+        parts = result.stdout.decode().strip().split()
+        assert len(parts) == 2
+        assert parts[0] != parts[1]  # sequential reads differ
+
+    def test_getrandom_and_dev_urandom_independent(self):
+        """getrandom() and /dev/urandom use separate PRNG streams."""
+        policy = Policy(random_seed=42)
+        result = Sandbox(policy).run(
+            ["python3", "-c",
+             "import os\n"
+             "a=os.urandom(8).hex()\n"
+             "b=open('/dev/urandom','rb').read(8).hex()\n"
+             "print(f'{a} {b}')"]
+        )
+        assert result.success
+        parts = result.stdout.decode().strip().split()
+        assert len(parts) == 2
+        assert parts[0] != parts[1]  # different streams

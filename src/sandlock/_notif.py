@@ -416,6 +416,11 @@ class NotifSupervisor:
         self._disk_quota_path = disk_quota_path
         self._disk_quota_bytes = disk_quota_bytes
         self._cow_handler = None  # CowHandler | None
+        # Deterministic randomness
+        self._det_random = None  # DeterministicRandom | None
+        if policy.random_seed is not None:
+            from ._random import DeterministicRandom
+            self._det_random = DeterministicRandom(policy.random_seed)
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
         # Resource state (memory, process count, fork-hold)
@@ -560,6 +565,15 @@ class NotifSupervisor:
         pid = notif.pid
         self._proc_pids.add(pid)
         nr = notif.data.nr
+
+        # --- Deterministic randomness ---
+        if self._det_random is not None:
+            from ._random import NR_GETRANDOM, handle_getrandom
+            if nr == NR_GETRANDOM:
+                handle_getrandom(notif, self._det_random,
+                                 self._id_valid, self._respond_val,
+                                 self._respond_continue)
+                return
 
         # --- Resource: memory + process limits ---
         from ._resource import MEMORY_NRS, FORK_NRS, handle_memory, handle_fork
@@ -871,6 +885,16 @@ class NotifSupervisor:
 
         # TOCTTOU check: verify notification is still valid
         if not self._id_valid(notif.id):
+            return
+
+        # --- Deterministic /dev/urandom, /dev/random ---
+        if self._det_random is not None and path in ("/dev/urandom", "/dev/random"):
+            from ._random import make_dev_random_fd
+            fd = make_dev_random_fd(self._policy.random_seed)
+            try:
+                self._respond_addfd(notif.id, fd)
+            finally:
+                os.close(fd)
             return
 
         # --- COW: redirect opens under workdir to upper dir ---

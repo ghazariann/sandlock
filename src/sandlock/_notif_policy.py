@@ -88,6 +88,9 @@ class NotifPolicy:
     cow_enabled: bool = False
     """If True, filesystem COW syscalls (unlinkat, mkdirat, etc.) are intercepted."""
 
+    random_seed: int | None = None
+    """If set, getrandom() returns deterministic PRNG output."""
+
     def decide(
         self,
         path: str,
