@@ -660,18 +660,26 @@ class NotifSupervisor:
             nr_link = _SYSCALL_NR.get("link")
             nr_fchmodat = _SYSCALL_NR.get("fchmodat")
             nr_chmod = _SYSCALL_NR.get("chmod")
+            nr_fchownat = _SYSCALL_NR.get("fchownat")
+            nr_chown = _SYSCALL_NR.get("chown")
+            nr_lchown = _SYSCALL_NR.get("lchown")
             nr_readlinkat = _SYSCALL_NR.get("readlinkat")
             nr_readlink = _SYSCALL_NR.get("readlink")
             nr_truncate = _SYSCALL_NR.get("truncate")
+            nr_utimensat = _SYSCALL_NR.get("utimensat")
+            nr_futimesat = _SYSCALL_NR.get("futimesat")
 
             # *at variants: dirfd=arg0, pathname=arg1
             cow_at_nrs = {nr_unlinkat, nr_mkdirat, nr_renameat2,
                           nr_newfstatat, nr_statx, nr_faccessat,
-                          nr_fchmodat, nr_readlinkat} - {None}
+                          nr_fchmodat, nr_fchownat, nr_readlinkat,
+                          nr_utimensat} - {None}
             # non-at variants: pathname=arg0
             cow_plain_nrs = {nr_unlink, nr_rmdir, nr_mkdir, nr_rename,
                              nr_stat, nr_lstat, nr_access,
-                             nr_chmod, nr_readlink, nr_truncate} - {None}
+                             nr_chmod, nr_chown, nr_lchown,
+                             nr_readlink, nr_truncate,
+                             nr_futimesat} - {None}
             # Special arg layouts
             cow_special_nrs = {nr_symlinkat, nr_symlink,
                                nr_linkat, nr_link} - {None}
@@ -833,6 +841,74 @@ class NotifSupervisor:
                     if nr in (nr_fchmodat, nr_chmod):
                         mode = notif.data.args[2] if nr == nr_fchmodat else notif.data.args[1]
                         if self._cow_handler.handle_chmod(path, mode & 0o7777):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # chown / fchownat / lchown
+                    if nr in (nr_fchownat, nr_chown, nr_lchown):
+                        if nr == nr_fchownat:
+                            uid = ctypes.c_int32(notif.data.args[2] & 0xFFFFFFFF).value
+                            gid = ctypes.c_int32(notif.data.args[3] & 0xFFFFFFFF).value
+                            follow = not bool(notif.data.args[4] & 0x100)  # AT_SYMLINK_NOFOLLOW
+                        elif nr == nr_chown:
+                            uid = ctypes.c_int32(notif.data.args[1] & 0xFFFFFFFF).value
+                            gid = ctypes.c_int32(notif.data.args[2] & 0xFFFFFFFF).value
+                            follow = True
+                        else:  # lchown
+                            uid = ctypes.c_int32(notif.data.args[1] & 0xFFFFFFFF).value
+                            gid = ctypes.c_int32(notif.data.args[2] & 0xFFFFFFFF).value
+                            follow = False
+                        if self._cow_handler.handle_chown(path, uid, gid,
+                                                          follow_symlinks=follow):
+                            self._respond_val(notif.id, 0)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # utimensat / futimesat
+                    if nr in (nr_utimensat, nr_futimesat):
+                        UTIME_NOW = (1 << 30) - 1
+                        UTIME_OMIT = (1 << 30) - 2
+                        times = None  # default: current time
+                        if nr == nr_utimensat:
+                            # utimensat(dirfd, path, times[2], flags)
+                            times_addr = notif.data.args[2]
+                            follow = not bool(notif.data.args[3] & 0x100)
+                            if times_addr != 0:
+                                from ._procfs import read_bytes as _read
+                                raw = _read(pid, times_addr, 32)
+                                a_s, a_ns = struct.unpack_from("<qQ", raw, 0)
+                                m_s, m_ns = struct.unpack_from("<qQ", raw, 16)
+                                atime = None if a_ns == UTIME_OMIT else (
+                                    None if a_ns == UTIME_NOW else a_s + a_ns / 1e9)
+                                mtime = None if m_ns == UTIME_OMIT else (
+                                    None if m_ns == UTIME_NOW else m_s + m_ns / 1e9)
+                                if atime is not None or mtime is not None:
+                                    # Need current stat for OMIT fields
+                                    real = self._cow_handler.handle_stat(path)
+                                    if real:
+                                        st = os.stat(real)
+                                        if atime is None:
+                                            atime = st.st_atime
+                                        if mtime is None:
+                                            mtime = st.st_mtime
+                                    times = (atime or 0, mtime or 0)
+                                # both UTIME_NOW → times=None (current time)
+                        else:
+                            # futimesat(dirfd, path, times[2])
+                            times_addr = notif.data.args[2]
+                            follow = True
+                            if times_addr != 0:
+                                from ._procfs import read_bytes as _read
+                                raw = _read(pid, times_addr, 32)
+                                a_s, a_us = struct.unpack_from("<qQ", raw, 0)
+                                m_s, m_us = struct.unpack_from("<qQ", raw, 16)
+                                times = (a_s + a_us / 1e6,
+                                         m_s + m_us / 1e6)
+                        if self._cow_handler.handle_utimens(path, times,
+                                                            follow_symlinks=follow):
                             self._respond_val(notif.id, 0)
                         else:
                             self._respond_continue(notif.id)

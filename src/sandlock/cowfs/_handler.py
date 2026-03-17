@@ -209,3 +209,25 @@ class CowHandler:
         upper_file = self._branch.ensure_cow_copy(rel_path)
         os.truncate(str(upper_file), length)
         return True
+
+    def handle_chown(self, path: str, uid: int, gid: int,
+                     follow_symlinks: bool = True) -> bool:
+        """Handle chown/fchownat: chown in upper (COW copy if needed)."""
+        rel_path = os.path.relpath(path, self._workdir_str)
+        upper_file = self._branch.ensure_cow_copy(rel_path)
+        os.chown(str(upper_file), uid, gid,
+                 follow_symlinks=follow_symlinks)
+        return True
+
+    def handle_utimens(self, path: str,
+                       times: tuple[float, float] | None,
+                       follow_symlinks: bool = True) -> bool:
+        """Handle utimensat: set timestamps in upper (COW copy if needed).
+
+        times is (atime, mtime) as floats, or None for current time.
+        """
+        rel_path = os.path.relpath(path, self._workdir_str)
+        upper_file = self._branch.ensure_cow_copy(rel_path)
+        os.utime(str(upper_file), times=times,
+                 follow_symlinks=follow_symlinks)
+        return True

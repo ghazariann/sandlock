@@ -1065,6 +1065,78 @@ class TestCOW:
             assert result.success
             assert b"orig=51200" in result.stdout
 
+    def test_cow_chown_goes_to_upper(self, isolation):
+        """chown on a COW file operates on the upper copy, not the original."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            with open(f"{td}/project/file.txt", "w") as f:
+                f.write("data")
+            orig_stat = os.stat(f"{td}/project/file.txt")
+
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
+                on_exit=BranchAction.ABORT,
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", """
+import os
+# chown to same uid/gid (always allowed, but triggers COW copy)
+st = os.stat('file.txt')
+os.chown('file.txt', st.st_uid, st.st_gid)
+# Verify the file is still readable after chown
+print('OK', open('file.txt').read())
+"""]
+            )
+            assert result.success
+            assert b"OK data" in result.stdout
+            # Original unchanged after abort
+            assert open(f"{td}/project/file.txt").read() == "data"
+
+    def test_cow_utimensat_goes_to_upper(self, isolation):
+        """utime on a COW file operates on the upper copy, not the original."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            with open(f"{td}/project/file.txt", "w") as f:
+                f.write("data")
+            orig_mtime = os.stat(f"{td}/project/file.txt").st_mtime
+
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
+                on_exit=BranchAction.ABORT,
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", """
+import os
+os.utime('file.txt', (1000000, 1000000))
+st = os.stat('file.txt')
+print(f'MTIME {int(st.st_mtime)}')
+"""]
+            )
+            assert result.success
+            assert b"MTIME 1000000" in result.stdout
+            # Original mtime unchanged after abort
+            assert os.stat(f"{td}/project/file.txt").st_mtime == orig_mtime
+
+    def test_cow_utimensat_committed(self, isolation):
+        """utime changes are committed on success."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            with open(f"{td}/project/file.txt", "w") as f:
+                f.write("data")
+
+            policy = _make_cow_policy(f"{td}/project", td, isolation)
+            result = Sandbox(policy).run(
+                ["python3", "-c", """
+import os
+os.utime('file.txt', (2000000, 2000000))
+print('OK')
+"""]
+            )
+            assert result.success
+            assert b"OK" in result.stdout
+            # After commit, mtime should be updated
+            assert int(os.stat(f"{td}/project/file.txt").st_mtime) == 2000000
+
 
 # --- Deterministic randomness ---
 
