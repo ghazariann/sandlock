@@ -415,6 +415,94 @@ class TestPortRemap:
         # At least our bound port should be visible
         assert len(result.value) >= 1
 
+    def test_tcp_sendmsg_2mb_with_port_remap(self):
+        """TCP sendmsg() with 2 MB payload works correctly under port remap."""
+        import socket as sock_mod
+        import select
+
+        def server_client():
+            DATA_SIZE = 2 * 1024 * 1024  # 2 MB
+
+            server = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            server.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 7070))
+            server.listen(1)
+            server_port = server.getsockname()[1]
+
+            # Client connects and sends 2 MB via sendmsg()
+            client = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            client.setblocking(False)
+            try:
+                client.connect(("127.0.0.1", 7070))
+            except BlockingIOError:
+                pass
+
+            conn, _ = server.accept()
+            conn.setblocking(False)
+
+            # Wait for client to be writable (connected)
+            select.select([], [client], [])
+
+            payload = b"\xab" * DATA_SIZE
+            total_sent = 0
+            received = bytearray()
+
+            # Interleave sendmsg and recv using select
+            while total_sent < DATA_SIZE or len(received) < DATA_SIZE:
+                r_list = [conn] if len(received) < DATA_SIZE else []
+                w_list = [client] if total_sent < DATA_SIZE else []
+                readable, writable, _ = select.select(r_list, w_list, [], 10)
+
+                if client in writable and total_sent < DATA_SIZE:
+                    chunk = payload[total_sent:total_sent + 262144]
+                    try:
+                        n = client.sendmsg([chunk])
+                        total_sent += n
+                    except BlockingIOError:
+                        pass
+
+                if conn in readable:
+                    try:
+                        data = conn.recv(65536)
+                        if data:
+                            received.extend(data)
+                        elif total_sent >= DATA_SIZE:
+                            break
+                    except BlockingIOError:
+                        pass
+
+                if total_sent >= DATA_SIZE and client.fileno() != -1:
+                    client.shutdown(sock_mod.SHUT_WR)
+
+            # Drain remaining data after shutdown
+            while len(received) < DATA_SIZE:
+                readable, _, _ = select.select([conn], [], [], 5)
+                if not readable:
+                    break
+                data = conn.recv(65536)
+                if not data:
+                    break
+                received.extend(data)
+
+            conn.close()
+            client.close()
+            server.close()
+
+            return {
+                "server_port": server_port,
+                "sent": total_sent,
+                "received": len(received),
+                "data_ok": bytes(received) == payload,
+            }
+
+        policy = Policy(port_remap=True)
+        result = Sandbox(policy).call(server_client)
+
+        assert result.success, f"Sandbox failed: {result}"
+        assert result.value["server_port"] == 7070  # getsockname returns virtual
+        assert result.value["sent"] == result.value["received"]
+        assert result.value["data_ok"] is True
+
 
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""
