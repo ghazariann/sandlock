@@ -2,6 +2,7 @@
 """Tests for sandlock.sandbox.Sandbox."""
 
 import os
+import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -9,6 +10,11 @@ import pytest
 from sandlock.policy import Policy
 from sandlock.sandbox import Sandbox
 from sandlock.exceptions import SandboxError
+
+_PYTHON_READABLE = list(dict.fromkeys([
+    "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
+    sys.prefix,
+]))
 
 
 class TestSandboxInit:
@@ -311,7 +317,7 @@ class TestPortRemap:
         )
         policy = Policy(
             port_remap=True,
-            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+            fs_readable=_PYTHON_READABLE,
         )
         result = Sandbox(policy).run(["python3", "-c", code])
 
@@ -333,7 +339,7 @@ class TestPortRemap:
         )
         policy = Policy(
             port_remap=True,
-            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+            fs_readable=_PYTHON_READABLE,
         )
         result = Sandbox(policy).run(["python3", "-c", code])
 
@@ -361,7 +367,7 @@ class TestPortRemap:
         )
         policy = Policy(
             port_remap=True,
-            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+            fs_readable=_PYTHON_READABLE,
         )
         result = Sandbox(policy).run(["python3", "-c", code])
 
