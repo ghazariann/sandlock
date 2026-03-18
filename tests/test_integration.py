@@ -1228,6 +1228,21 @@ class TestDeterministicTime:
         # Should have elapsed ~0.1 seconds
         assert 0.05 < result.value < 0.5
 
+    def test_time_start_shifts_clock_in_run(self):
+        """Sandbox.run with time_start sees shifted time (vDSO patched remotely)."""
+        policy = Policy(
+            time_start="2000-01-01T00:00:00Z",
+            fs_readable=_PYTHON_READABLE,
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c",
+             "import time,datetime;"
+             "print(datetime.datetime.fromtimestamp("
+             "time.time(),tz=datetime.timezone.utc).year)"]
+        )
+        assert result.success, f"Failed: {result.stderr}"
+        assert b"2000" in result.stdout
+
     def test_time_start_none_is_real_time(self):
         """Without time_start, time is real."""
         def check_year():

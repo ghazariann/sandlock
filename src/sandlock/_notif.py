@@ -423,6 +423,7 @@ class NotifSupervisor:
             self._det_random = DeterministicRandom(policy.random_seed)
         # Deterministic time
         self._time_offset = None  # TimeOffset | None
+        self._vdso_patched_pids: set[int] = set()
         if policy.time_start is not None:
             from ._time import TimeOffset
             self._time_offset = TimeOffset(policy.time_start)
@@ -559,6 +560,20 @@ class NotifSupervisor:
             except Exception:
                 pass
 
+        # Post-dispatch: patch vDSO for new PIDs (after exec).
+        # /proc/pid/mem writes to vDSO only stick when the child is
+        # running (not in seccomp-stop).  A background thread retries
+        # the write while the notification loop keeps responding to
+        # syscalls, giving the child running windows between stops.
+        if self._time_offset is not None:
+            pid = notif.pid
+            if pid not in self._vdso_patched_pids:
+                self._vdso_patched_pids.add(pid)
+                import threading
+                def _patch(p=pid):
+                    from ._vdso import disable_vdso_remote
+                    disable_vdso_remote(p)
+                threading.Thread(target=_patch, daemon=True).start()
 
     @property
     def tracked_pids(self) -> set[int]:

@@ -6,13 +6,15 @@ clock_gettime/gettimeofday without a real syscall, bypassing seccomp.
 This module patches the vDSO function code to do real syscalls instead,
 so seccomp can intercept them for time virtualization.
 
-Currently only supports in-process patching (Sandbox.call). Patching
-after exec (Sandbox.run) requires a vDSO remapping solution — TBD.
+For Sandbox.call (no exec): patches in-process via mprotect + write.
+For Sandbox.run (after exec): patches via /proc/pid/mem with retries,
+since writes only take effect when the child is not in seccomp-stop.
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 import struct
 
 # x86_64: per-function stubs that do real syscalls.
@@ -36,10 +38,11 @@ _STUBS_AARCH64 = {
 _libc = ctypes.CDLL(None, use_errno=True)
 
 
-def _find_vdso() -> tuple[int, int] | None:
-    """Find the vDSO mapping address and size from /proc/self/maps."""
+def _find_vdso(pid: int | None = None) -> tuple[int, int] | None:
+    """Find the vDSO mapping address and size from /proc/[pid]/maps."""
+    maps = f"/proc/{pid}/maps" if pid else "/proc/self/maps"
     try:
-        with open("/proc/self/maps") as f:
+        with open(maps) as f:
             for line in f:
                 if "[vdso]" in line:
                     addr_range = line.split()[0]
@@ -188,3 +191,80 @@ def disable_vdso_local() -> None:
         ctypes.c_void_p(vdso_addr), vdso_size,
         PROT_READ | PROT_EXEC,
     )
+
+
+def _get_stubs() -> dict[bytes, bytes] | None:
+    """Return the per-function stub map for the current architecture."""
+    import platform
+    arch = platform.machine()
+    if arch == "x86_64":
+        return _STUBS_X86_64
+    elif arch == "aarch64":
+        return _STUBS_AARCH64
+    return None
+
+
+def _write_vdso_stubs(pid: int) -> bool:
+    """Write syscall stubs to a remote process's vDSO via /proc/pid/mem.
+
+    Returns True if the write was attempted (stubs written), False if
+    the vDSO couldn't be found or parsed.
+
+    Note: /proc/pid/mem writes to vDSO only take effect when the target
+    process is NOT in seccomp-stop. The caller must retry if needed.
+    """
+    stubs = _get_stubs()
+    if stubs is None:
+        return False
+
+    info = _find_vdso(pid)
+    if info is None:
+        return False
+    vdso_addr, vdso_size = info
+
+    try:
+        fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
+    except OSError:
+        return False
+
+    try:
+        os.lseek(fd, vdso_addr, os.SEEK_SET)
+        data = os.read(fd, vdso_size)
+        if len(data) != vdso_size:
+            return False
+
+        symbols = _parse_vdso_symbols(data)
+        if not symbols:
+            return False
+
+        for name, off in symbols:
+            stub = stubs.get(name)
+            if stub is not None:
+                os.lseek(fd, vdso_addr + off, os.SEEK_SET)
+                os.write(fd, stub)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def disable_vdso_remote(pid: int, retries: int = 20,
+                        interval: float = 0.001) -> None:
+    """Patch the vDSO in a remote process via /proc/pid/mem.
+
+    /proc/pid/mem writes to vDSO pages only take effect when the target
+    is running (not in seccomp-stop). This function retries with short
+    sleeps to catch the process between seccomp notifications.
+
+    Should be called from a background thread so it doesn't block the
+    notification loop (which needs to keep responding to free the child
+    from seccomp-stop periodically).
+    """
+    import time
+    for _ in range(retries):
+        try:
+            _write_vdso_stubs(pid)
+        except OSError:
+            return  # Process gone
+        time.sleep(interval)
