@@ -1387,6 +1387,31 @@ class TestDeterministicTime:
         assert result.success, f"Failed: {result.stderr}"
         assert b"2000" in result.stdout
 
+    def test_time_start_monotonic_near_zero(self):
+        """With time_start, monotonic clock starts near zero (time namespace)."""
+        def check_monotonic():
+            import time
+            return time.monotonic()
+
+        policy = Policy(time_start="2000-01-01T00:00:00Z")
+        result = Sandbox(policy).call(check_monotonic)
+        assert result.success, f"Failed: {result.error}"
+        # Monotonic should be near 0 (within a few seconds of sandbox start)
+        assert result.value < 5.0, f"Monotonic too high: {result.value}"
+
+    def test_time_start_monotonic_near_zero_run(self):
+        """With time_start, monotonic clock starts near zero in run mode."""
+        policy = Policy(
+            time_start="2000-01-01T00:00:00Z",
+            fs_readable=_PYTHON_READABLE,
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", "import time; print(time.monotonic())"]
+        )
+        assert result.success, f"Failed: {result.stderr}"
+        mono = float(result.stdout.strip())
+        assert mono < 5.0, f"Monotonic too high: {mono}"
+
     def test_time_start_none_is_real_time(self):
         """Without time_start, time is real."""
         def check_year():
