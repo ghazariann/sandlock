@@ -130,6 +130,45 @@ class TestPdeathsig:
                 pass  # Expected — process is gone
 
 
+class TestNoCoredump:
+    def test_no_coredump_disables_dumpable(self):
+        """no_coredump sets PR_SET_DUMPABLE to 0."""
+        def check_dumpable():
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            PR_GET_DUMPABLE = 3
+            return libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+
+        policy = Policy(no_coredump=True)
+        result = Sandbox(policy).call(check_dumpable)
+        assert result.success, f"Failed: {result.error}"
+        assert result.value == 0
+
+    def test_default_is_dumpable(self):
+        """Without no_coredump, process is dumpable."""
+        def check_dumpable():
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            PR_GET_DUMPABLE = 3
+            return libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+
+        policy = Policy()
+        result = Sandbox(policy).call(check_dumpable)
+        assert result.success, f"Failed: {result.error}"
+        assert result.value == 1
+
+    def test_no_coredump_run(self):
+        """no_coredump sets RLIMIT_CORE=0 which survives exec."""
+        policy = Policy(no_coredump=True)
+        result = Sandbox(policy).run(
+            ["python3", "-c",
+             "import resource;"
+             "print(resource.getrlimit(resource.RLIMIT_CORE))"]
+        )
+        assert result.success
+        assert result.stdout.strip() == b"(0, 0)"
+
+
 class TestCallIntegration:
     def test_return_value(self):
         result = Sandbox(Policy()).call(lambda: {"answer": 42})

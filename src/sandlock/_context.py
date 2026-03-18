@@ -594,6 +594,20 @@ class SandboxContext:
                     ADDR_NO_RANDOMIZE = 0x0040000
                     _libc.personality(ctypes.c_ulong(ADDR_NO_RANDOMIZE))
 
+                # 3b. Disable core dumps and /proc/pid access
+                if self._policy.no_coredump:
+                    import resource
+                    # PR_SET_DUMPABLE=0 restricts /proc/pid access and
+                    # disables core dumps.  Effective for Sandbox.call();
+                    # exec() resets dumpable to 1, so for Sandbox.run()
+                    # we also set RLIMIT_CORE=0 which survives exec.
+                    _PR_SET_DUMPABLE = 4
+                    _libc.prctl(ctypes.c_int(_PR_SET_DUMPABLE),
+                                ctypes.c_ulong(0),
+                                ctypes.c_ulong(0), ctypes.c_ulong(0),
+                                ctypes.c_ulong(0))
+                    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
                 # 4. Landlock confinement (filesystem + network, irreversible)
                 writable = list(self._policy.fs_writable)
                 readable = list(self._policy.fs_readable)

@@ -132,6 +132,11 @@ class Policy:
     isolate_signals: bool = False
     """Block sending signals to processes outside the sandbox."""
 
+    no_coredump: bool = False
+    """Disable core dumps and restrict /proc/pid access from other
+    processes.  Applied via prctl(PR_SET_DUMPABLE, 0).  Prevents
+    leaking sandbox memory contents but breaks gdb/strace/perf."""
+
     # Network (Landlock ABI v4+, TCP only)
     net_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may bind.  Empty = unrestricted.
