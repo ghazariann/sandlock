@@ -14,16 +14,13 @@ def example_run_command():
     print()
 
 
-def example_call_function():
-    """Run a Python function in a sandbox."""
-    print("=== Call function ===")
+def example_run_python():
+    """Run a Python expression in a sandbox."""
+    print("=== Run Python ===")
 
-    def compute(x, y):
-        return x ** y
-
-    result = Sandbox(Policy()).call(compute, args=(2, 10))
+    result = Sandbox(Policy()).run(["python3", "-c", "print(2 ** 10)"])
     print(f"  success: {result.success}")
-    print(f"  value: {result.value}")
+    print(f"  stdout: {result.stdout.decode().strip()}")
     print()
 
 
@@ -42,5 +39,5 @@ def example_with_policy():
 
 if __name__ == "__main__":
     example_run_command()
-    example_call_function()
+    example_run_python()
     example_with_policy()

@@ -12,12 +12,12 @@ import signal
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Optional
 
 from .exceptions import SandboxError, BranchError
 from .policy import BranchAction, FsIsolation, Policy
 from ._context import SandboxContext
-from ._runner import Result, call_in_sandbox, run_command_in_sandbox, run_interactive_in_sandbox
+from ._runner import Result, run_command_in_sandbox, run_interactive_in_sandbox
 
 
 class Sandbox:
@@ -30,9 +30,6 @@ class Sandbox:
 
         # One-shot command
         result = Sandbox(policy).run(["python", "untrusted.py"])
-
-        # One-shot callable
-        result = Sandbox(policy).call(my_func, args=(arg1,))
 
         # Long-lived sandbox
         with Sandbox(policy) as sb:
@@ -153,41 +150,6 @@ class Sandbox:
         try:
             result = run_interactive_in_sandbox(
                 cmd, policy, self._id,
-                timeout=timeout,
-            )
-            self._finish_branch(error=not result.success)
-            return result
-        except BaseException:
-            self._finish_branch(error=True)
-            raise
-        finally:
-            self._cleanup_mount()
-
-    def call(
-        self,
-        fn: Callable,
-        args: tuple = (),
-        *,
-        timeout: float | None = None,
-    ) -> Result:
-        """Run a Python callable in a sandbox and return the result.
-
-        The callable is executed in a forked child process. The return
-        value is passed back via a pipe (must be JSON-serializable).
-
-        Args:
-            fn: Callable to execute.
-            args: Positional arguments for fn.
-            timeout: Maximum seconds to wait.
-
-        Returns:
-            Result with the return value or error.
-        """
-        branch = self._setup_branch()
-        policy = self._effective_policy()
-        try:
-            result = call_in_sandbox(
-                fn, args, policy, self._id,
                 timeout=timeout,
             )
             self._finish_branch(error=not result.success)
@@ -423,13 +385,54 @@ class Sandbox:
         else:
             sb = cls(policy)
 
-        # The restore target: call restore_fn with the saved state
+        # The restore target: run restore_fn with the saved state
+        # Uses internal fork-based execution (not the public run() API)
+        # because restore_fn may be a closure that can't be serialized.
         app_state = checkpoint.app_state
 
         def _restore_target():
             restore_fn(app_state)
 
-        return sb.call(_restore_target, timeout=timeout)
+        branch = sb._setup_branch()
+        policy = sb._effective_policy()
+        try:
+            import dataclasses
+
+            inner_policy = dataclasses.replace(policy, close_fds=False)
+            for attr in ('_overlay_branch', '_cow_branch'):
+                val = getattr(policy, attr, None)
+                if val is not None:
+                    object.__setattr__(inner_policy, attr, val)
+
+            try:
+                with SandboxContext(
+                    _restore_target, inner_policy, sb._id,
+                ) as ctx:
+                    try:
+                        exit_code = ctx.wait(timeout=timeout)
+                    except TimeoutError:
+                        ctx.abort()
+                        result = Result(
+                            success=False, exit_code=-1,
+                            error="Sandbox timed out",
+                        )
+                        sb._finish_branch(error=True)
+                        return result
+            except Exception as e:
+                sb._finish_branch(error=True)
+                return Result(success=False, exit_code=-1, error=str(e))
+
+            result = Result(
+                success=(exit_code == 0),
+                exit_code=exit_code,
+            )
+            sb._finish_branch(error=not result.success)
+            return result
+        except BaseException:
+            sb._finish_branch(error=True)
+            raise
+        finally:
+            sb._cleanup_mount()
 
     # --- Nested sandbox ---
 

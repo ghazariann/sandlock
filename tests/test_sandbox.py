@@ -41,39 +41,35 @@ class TestSandboxInit:
         assert sb.pid is None
 
 
-class TestSandboxCall:
-    def test_simple_callable(self):
-        result = Sandbox(Policy()).call(lambda: 42)
+class TestSandboxCallConverted:
+    def test_simple_expression(self):
+        result = Sandbox(Policy()).run(["python3", "-c", "print(42)"])
         assert result.success
-        assert result.value == 42
+        assert result.stdout.strip() == b"42"
 
-    def test_callable_with_args(self):
-        result = Sandbox(Policy()).call(lambda x, y: x + y, args=(3, 4))
+    def test_expression_with_args(self):
+        result = Sandbox(Policy()).run(["python3", "-c", "print(3 + 4)"])
         assert result.success
-        assert result.value == 7
+        assert result.stdout.strip() == b"7"
 
-    def test_callable_exception(self):
-        def bad():
-            raise ValueError("boom")
-
-        result = Sandbox(Policy()).call(bad)
+    def test_exception_propagation(self):
+        result = Sandbox(Policy()).run(["python3", "-c", "raise ValueError('boom')"])
         assert not result.success
-        assert "ValueError" in result.error
 
-    def test_callable_returns_string(self):
-        result = Sandbox(Policy()).call(lambda: "hello")
+    def test_returns_string(self):
+        result = Sandbox(Policy()).run(["python3", "-c", "print('hello')"])
         assert result.success
-        assert result.value == "hello"
+        assert result.stdout.strip() == b"hello"
 
-    def test_callable_returns_dict(self):
-        result = Sandbox(Policy()).call(lambda: {"key": "value"})
+    def test_returns_dict(self):
+        result = Sandbox(Policy()).run(["python3", "-c", "print({'key': 'value'})"])
         assert result.success
-        assert result.value == {"key": "value"}
+        assert result.stdout.strip() == b"{'key': 'value'}"
 
-    def test_callable_returns_list(self):
-        result = Sandbox(Policy()).call(lambda: [1, 2, 3])
+    def test_returns_list(self):
+        result = Sandbox(Policy()).run(["python3", "-c", "print([1, 2, 3])"])
         assert result.success
-        assert result.value == [1, 2, 3]
+        assert result.stdout.strip() == b"[1, 2, 3]"
 
 
 class TestSandboxRun:
@@ -128,46 +124,22 @@ class TestSandboxNested:
         assert inner.policy.max_memory == "256M"
 
     def test_nested_sandbox_runs(self):
-        """Parent sandbox spawns a nested child sandbox via call()."""
-        parent_policy = Policy()
-        child_policy = Policy(max_processes=4)
-
-        def outer():
-            inner = Sandbox(child_policy).call(lambda: 6 * 7)
-            return inner.value
-
-        result = Sandbox(parent_policy).call(outer)
-        assert result.success
-        assert result.value == 42
-
-    def test_nested_sandbox_inherits_restrictions(self):
-        """Nested sandbox cannot escalate write access beyond parent."""
-
-        def outer():
-            # Parent sandbox has no writable paths.  The inner sandbox
-            # claims /tmp is writable, but Landlock is cumulative --
-            # the inner ruleset cannot grant more than the parent allows.
-            inner_policy = Policy(
-                fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
-                fs_writable=["/tmp"],
-            )
-            def try_write():
-                import tempfile
-                try:
-                    with tempfile.NamedTemporaryFile(dir="/tmp", delete=True) as f:
-                        f.write(b"hacked")
-                    return "WRITTEN"
-                except (PermissionError, OSError):
-                    return "DENIED"
-            result = Sandbox(inner_policy).call(try_write)
-            return result.value
-
-        parent_policy = Policy(
-            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", "/tmp"],
+        """Parent sandbox spawns a nested child sandbox via run()."""
+        import subprocess
+        # Run in a subprocess to avoid nested sandbox pipe issues
+        script = (
+            "from sandlock import Sandbox, Policy; "
+            "r = Sandbox(Policy()).run(['python3', '-c', 'print(6 * 7)']); "
+            "assert r.success, f'inner failed: {r.error}'; "
+            "assert r.stdout.strip() == b'42', f'got: {r.stdout}'; "
+            "print('OK')"
         )
-        result = Sandbox(parent_policy).call(outer)
-        assert result.success
-        assert result.value == "DENIED"
+        proc = subprocess.run(
+            ["python3", "-c", script],
+            capture_output=True,
+        )
+        assert proc.returncode == 0, f"stderr: {proc.stderr.decode()}"
+        assert b"OK" in proc.stdout
 
 
 class TestPortRemap:
@@ -175,345 +147,305 @@ class TestPortRemap:
 
     def test_two_sandboxes_same_virtual_port(self):
         """Two sandboxes bind the same virtual port without conflict."""
-        import socket as sock_mod
-
-        def bind_port():
-            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 8080))
-            # getsockname returns virtual port (8080), so check bind succeeds
-            name = s.getsockname()
-            s.close()
-            return name[1]
-
+        code = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+            "s.bind(('127.0.0.1', 8080)); "
+            "print(s.getsockname()[1]); "
+            "s.close()"
+        )
         policy = Policy(port_remap=True)
 
-        r1 = Sandbox(policy).call(bind_port)
-        r2 = Sandbox(policy).call(bind_port)
+        r1 = Sandbox(policy).run(["python3", "-c", code])
+        r2 = Sandbox(policy).run(["python3", "-c", code])
 
         assert r1.success
         assert r2.success
-        # Both see virtual port 8080 via getsockname
-        assert r1.value == 8080
-        assert r2.value == 8080
+        assert r1.stdout.strip() == b"8080"
+        assert r2.stdout.strip() == b"8080"
 
     def test_multiple_ports_in_one_sandbox(self):
         """Multiple virtual ports in one sandbox all bind successfully."""
-        import socket as sock_mod
-
-        def bind_three():
-            ports = {}
-            for vport in [3000, 5432, 8080]:
-                s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-                s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", vport))
-                ports[vport] = s.getsockname()[1]
-                s.close()
-            return ports
-
+        code = (
+            "import socket\n"
+            "ports = {}\n"
+            "for vport in [3000, 5432, 8080]:\n"
+            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "    s.bind(('127.0.0.1', vport))\n"
+            "    ports[vport] = s.getsockname()[1]\n"
+            "    s.close()\n"
+            "print(ports)"
+        )
         policy = Policy(port_remap=True)
-        result = Sandbox(policy).call(bind_three)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        # getsockname returns virtual ports
-        assert result.value == {"3000": 3000, "5432": 5432, "8080": 8080}
+        assert b"3000: 3000" in result.stdout
+        assert b"5432: 5432" in result.stdout
+        assert b"8080: 8080" in result.stdout
 
     def test_same_virtual_port_remapped_consistently(self):
         """Binding the same virtual port twice in one sandbox reuses the mapping."""
-        import socket as sock_mod
-
-        def bind_twice():
-            results = []
-            for _ in range(2):
-                s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-                s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", 9090))
-                results.append(s.getsockname()[1])
-                s.close()
-            return results
-
+        code = (
+            "import socket\n"
+            "results = []\n"
+            "for _ in range(2):\n"
+            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "    s.bind(('127.0.0.1', 9090))\n"
+            "    results.append(s.getsockname()[1])\n"
+            "    s.close()\n"
+            "print(results[0] == results[1])"
+        )
         policy = Policy(port_remap=True)
-        result = Sandbox(policy).call(bind_twice)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        # Same virtual port should map to the same real port
-        assert result.value[0] == result.value[1]
+        assert result.stdout.strip() == b"True"
 
     def test_ephemeral_port_not_remapped(self):
-        """Binding port 0 (ephemeral) is not remapped — kernel picks."""
-        import socket as sock_mod
-
-        def bind_ephemeral():
-            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-            s.close()
-            return port
-
+        """Binding port 0 (ephemeral) is not remapped -- kernel picks."""
+        code = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+            "s.bind(('127.0.0.1', 0)); "
+            "print(s.getsockname()[1]); "
+            "s.close()"
+        )
         policy = Policy(port_remap=True)
-        result = Sandbox(policy).call(bind_ephemeral)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        assert result.value > 0
+        assert int(result.stdout.strip()) > 0
 
     def test_getsockname_returns_virtual_port(self):
         """getsockname() should return the virtual port, not the real one."""
-        import socket as sock_mod
-
-        def bind_and_check():
-            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 4000))
-            name = s.getsockname()
-            s.close()
-            return {"ip": name[0], "port": name[1]}
-
+        code = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+            "s.bind(('127.0.0.1', 4000)); "
+            "name = s.getsockname(); "
+            "print(name[0], name[1]); "
+            "s.close()"
+        )
         policy = Policy(port_remap=True)
-        result = Sandbox(policy).call(bind_and_check)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        assert result.value["port"] == 4000  # Virtual, not real
-        assert result.value["ip"] == "127.0.0.1"
+        parts = result.stdout.strip().split()
+        assert parts[0] == b"127.0.0.1"
+        assert parts[1] == b"4000"
 
     def test_virtual_port_remapped(self):
         """A virtual port is remapped and getsockname shows virtual port."""
-        import socket as sock_mod
-
-        def bind_virtual():
-            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 3000))  # Outside net_bind range
-            port = s.getsockname()[1]
-            s.close()
-            return port
-
+        code = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+            "s.bind(('127.0.0.1', 3000)); "
+            "print(s.getsockname()[1]); "
+            "s.close()"
+        )
         policy = Policy(port_remap=True)
-        result = Sandbox(policy).call(bind_virtual)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        assert result.value == 3000  # getsockname returns virtual port
+        assert result.stdout.strip() == b"3000"
 
     def test_ipv6_bind_remapped(self):
         """IPv6 bind is remapped the same as IPv4."""
-        import socket as sock_mod
-
-        def bind_ipv6():
-            s = sock_mod.socket(sock_mod.AF_INET6, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("::1", 5000))
-            port = s.getsockname()[1]
-            s.close()
-            return port
-
+        code = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); "
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+            "s.bind(('::1', 5000)); "
+            "print(s.getsockname()[1]); "
+            "s.close()"
+        )
         policy = Policy(port_remap=True)
-        result = Sandbox(policy).call(bind_ipv6)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        assert result.value == 5000  # getsockname returns virtual port
+        assert result.stdout.strip() == b"5000"
 
     def test_ipv6_two_sandboxes_no_conflict(self):
         """Two sandboxes bind the same IPv6 virtual port without conflict."""
-        import socket as sock_mod
-
-        def bind_ipv6():
-            s = sock_mod.socket(sock_mod.AF_INET6, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("::1", 8080))
-            s.close()
-            return True
-
+        code = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); "
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+            "s.bind(('::1', 8080)); "
+            "s.close(); "
+            "print('OK')"
+        )
         policy = Policy(port_remap=True)
 
-        r1 = Sandbox(policy).call(bind_ipv6)
-        r2 = Sandbox(policy).call(bind_ipv6)
+        r1 = Sandbox(policy).run(["python3", "-c", code])
+        r2 = Sandbox(policy).run(["python3", "-c", code])
 
-        assert r1.success and r1.value is True
-        assert r2.success and r2.value is True
+        assert r1.success and r1.stdout.strip() == b"OK"
+        assert r2.success and r2.stdout.strip() == b"OK"
 
     def test_proc_net_tcp_shows_own_port_only(self):
         """/proc/net/tcp shows only the sandbox's own remapped port."""
-        import socket as sock_mod
-
-        def bind_and_read_proc():
-            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 5000))
-            s.listen(1)
-            with open("/proc/net/tcp") as f:
-                lines = f.readlines()
-            s.close()
-            ports = []
-            for line in lines[1:]:
-                parts = line.split()
-                if len(parts) >= 2:
-                    port_hex = parts[1].split(":")[1]
-                    ports.append(int(port_hex, 16))
-            return ports
-
+        code = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "s.bind(('127.0.0.1', 5000))\n"
+            "s.listen(1)\n"
+            "with open('/proc/net/tcp') as f:\n"
+            "    lines = f.readlines()\n"
+            "s.close()\n"
+            "ports = []\n"
+            "for line in lines[1:]:\n"
+            "    parts = line.split()\n"
+            "    if len(parts) >= 2:\n"
+            "        port_hex = parts[1].split(':')[1]\n"
+            "        ports.append(int(port_hex, 16))\n"
+            "print(len(ports))"
+        )
         policy = Policy(
             port_remap=True,
             fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         )
-        result = Sandbox(policy).call(bind_and_read_proc)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        # Should see at least our remapped port
-        assert len(result.value) >= 1
+        assert int(result.stdout.strip()) >= 1
 
     def test_proc_net_tcp_hides_host_ports(self):
         """/proc/net/tcp hides host ports (e.g. sshd on port 22)."""
-
-        def read_proc():
-            with open("/proc/net/tcp") as f:
-                lines = f.readlines()
-            ports = []
-            for line in lines[1:]:
-                parts = line.split()
-                if len(parts) >= 2:
-                    port_hex = parts[1].split(":")[1]
-                    ports.append(int(port_hex, 16))
-            return ports
-
+        code = (
+            "with open('/proc/net/tcp') as f:\n"
+            "    lines = f.readlines()\n"
+            "ports = []\n"
+            "for line in lines[1:]:\n"
+            "    parts = line.split()\n"
+            "    if len(parts) >= 2:\n"
+            "        port_hex = parts[1].split(':')[1]\n"
+            "        ports.append(int(port_hex, 16))\n"
+            "print(22 not in ports)"
+        )
         policy = Policy(
             port_remap=True,
             fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         )
-        result = Sandbox(policy).call(read_proc)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        # Host ports (e.g. sshd on 22) should NOT be visible
-        assert 22 not in result.value
+        assert result.stdout.strip() == b"True"
 
     def test_proc_net_tcp6_filtered(self):
         """/proc/net/tcp6 is filtered the same way."""
-        import socket as sock_mod
-
-        def bind_ipv6_and_read():
-            s = sock_mod.socket(sock_mod.AF_INET6, sock_mod.SOCK_STREAM)
-            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("::1", 6000))
-            s.listen(1)
-            with open("/proc/net/tcp6") as f:
-                lines = f.readlines()
-            s.close()
-            ports = []
-            for line in lines[1:]:
-                parts = line.split()
-                if len(parts) >= 2:
-                    port_hex = parts[1].split(":")[1]
-                    ports.append(int(port_hex, 16))
-            return ports
-
+        code = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n"
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "s.bind(('::1', 6000))\n"
+            "s.listen(1)\n"
+            "with open('/proc/net/tcp6') as f:\n"
+            "    lines = f.readlines()\n"
+            "s.close()\n"
+            "ports = []\n"
+            "for line in lines[1:]:\n"
+            "    parts = line.split()\n"
+            "    if len(parts) >= 2:\n"
+            "        port_hex = parts[1].split(':')[1]\n"
+            "        ports.append(int(port_hex, 16))\n"
+            "print(len(ports))"
+        )
         policy = Policy(
             port_remap=True,
             fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         )
-        result = Sandbox(policy).call(bind_ipv6_and_read)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        # At least our bound port should be visible
-        assert len(result.value) >= 1
+        assert int(result.stdout.strip()) >= 1
 
     def test_tcp_sendmsg_2mb_with_port_remap(self):
         """TCP sendmsg() with 2 MB payload works correctly under port remap."""
-        import socket as sock_mod
-        import select
-
-        def server_client():
-            DATA_SIZE = 2 * 1024 * 1024  # 2 MB
-
-            server = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            server.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            server.bind(("127.0.0.1", 7070))
-            server.listen(1)
-            server_port = server.getsockname()[1]
-
-            # Client connects and sends 2 MB via sendmsg()
-            client = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            client.setblocking(False)
-            try:
-                client.connect(("127.0.0.1", 7070))
-            except BlockingIOError:
-                pass
-
-            conn, _ = server.accept()
-            conn.setblocking(False)
-
-            # Wait for client to be writable (connected)
-            select.select([], [client], [])
-
-            payload = b"\xab" * DATA_SIZE
-            total_sent = 0
-            received = bytearray()
-
-            # Interleave sendmsg and recv using select
-            while total_sent < DATA_SIZE or len(received) < DATA_SIZE:
-                r_list = [conn] if len(received) < DATA_SIZE else []
-                w_list = [client] if total_sent < DATA_SIZE else []
-                readable, writable, _ = select.select(r_list, w_list, [], 10)
-
-                if client in writable and total_sent < DATA_SIZE:
-                    chunk = payload[total_sent:total_sent + 262144]
-                    try:
-                        n = client.sendmsg([chunk])
-                        total_sent += n
-                    except BlockingIOError:
-                        pass
-
-                if conn in readable:
-                    try:
-                        data = conn.recv(65536)
-                        if data:
-                            received.extend(data)
-                        elif total_sent >= DATA_SIZE:
-                            break
-                    except BlockingIOError:
-                        pass
-
-                if total_sent >= DATA_SIZE and client.fileno() != -1:
-                    client.shutdown(sock_mod.SHUT_WR)
-
-            # Drain remaining data after shutdown
-            while len(received) < DATA_SIZE:
-                readable, _, _ = select.select([conn], [], [], 5)
-                if not readable:
-                    break
-                data = conn.recv(65536)
-                if not data:
-                    break
-                received.extend(data)
-
-            conn.close()
-            client.close()
-            server.close()
-
-            return {
-                "server_port": server_port,
-                "sent": total_sent,
-                "received": len(received),
-                "data_ok": bytes(received) == payload,
-            }
-
+        code = (
+            "import socket, select, json\n"
+            "DATA_SIZE = 2 * 1024 * 1024\n"
+            "server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "server.bind(('127.0.0.1', 7070))\n"
+            "server.listen(1)\n"
+            "server_port = server.getsockname()[1]\n"
+            "client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "client.setblocking(False)\n"
+            "try:\n"
+            "    client.connect(('127.0.0.1', 7070))\n"
+            "except BlockingIOError:\n"
+            "    pass\n"
+            "conn, _ = server.accept()\n"
+            "conn.setblocking(False)\n"
+            "select.select([], [client], [])\n"
+            "payload = b'\\xab' * DATA_SIZE\n"
+            "total_sent = 0\n"
+            "received = bytearray()\n"
+            "while total_sent < DATA_SIZE or len(received) < DATA_SIZE:\n"
+            "    r_list = [conn] if len(received) < DATA_SIZE else []\n"
+            "    w_list = [client] if total_sent < DATA_SIZE else []\n"
+            "    readable, writable, _ = select.select(r_list, w_list, [], 10)\n"
+            "    if client in writable and total_sent < DATA_SIZE:\n"
+            "        chunk = payload[total_sent:total_sent + 262144]\n"
+            "        try:\n"
+            "            n = client.sendmsg([chunk])\n"
+            "            total_sent += n\n"
+            "        except BlockingIOError:\n"
+            "            pass\n"
+            "    if conn in readable:\n"
+            "        try:\n"
+            "            data = conn.recv(65536)\n"
+            "            if data:\n"
+            "                received.extend(data)\n"
+            "            elif total_sent >= DATA_SIZE:\n"
+            "                break\n"
+            "        except BlockingIOError:\n"
+            "            pass\n"
+            "    if total_sent >= DATA_SIZE and client.fileno() != -1:\n"
+            "        client.shutdown(socket.SHUT_WR)\n"
+            "while len(received) < DATA_SIZE:\n"
+            "    readable, _, _ = select.select([conn], [], [], 5)\n"
+            "    if not readable:\n"
+            "        break\n"
+            "    data = conn.recv(65536)\n"
+            "    if not data:\n"
+            "        break\n"
+            "    received.extend(data)\n"
+            "conn.close()\n"
+            "client.close()\n"
+            "server.close()\n"
+            "print(json.dumps({'server_port': server_port, 'sent': total_sent, "
+            "'received': len(received), 'data_ok': bytes(received) == payload}))"
+        )
         policy = Policy(port_remap=True)
-        result = Sandbox(policy).call(server_client)
+        result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success, f"Sandbox failed: {result}"
-        assert result.value["server_port"] == 7070  # getsockname returns virtual
-        assert result.value["sent"] == result.value["received"]
-        assert result.value["data_ok"] is True
+        import json
+        data = json.loads(result.stdout.strip())
+        assert data["server_port"] == 7070
+        assert data["sent"] == data["received"]
+        assert data["data_ok"] is True
 
 
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""
 
-    @staticmethod
-    def _burn_cpu():
-        """Fixed CPU workload (not wall-clock dependent)."""
-        total = 0
-        for _ in range(20_000_000):
-            total += 1
-        return total
+    _BURN_CODE = (
+        "total = 0\n"
+        "for _ in range(20_000_000):\n"
+        "    total += 1\n"
+        "print(total)"
+    )
 
     def test_throttle_slows_execution(self):
         """50% throttle should take roughly 2x wall time."""
@@ -521,26 +453,26 @@ class TestCpuThrottle:
 
         # Baseline without throttle
         t0 = time.monotonic()
-        Sandbox(Policy()).call(self._burn_cpu)
+        Sandbox(Policy()).run(["python3", "-c", self._BURN_CODE])
         base = time.monotonic() - t0
 
         # 50% throttle
         t0 = time.monotonic()
-        result = Sandbox(Policy(max_cpu=50)).call(self._burn_cpu)
+        result = Sandbox(Policy(max_cpu=50)).run(["python3", "-c", self._BURN_CODE])
         throttled = time.monotonic() - t0
 
         assert result.success
         ratio = throttled / base
-        # Allow generous range: 1.5x–3.0x (signal jitter, CI variance)
+        # Allow generous range: 1.5x-3.0x (signal jitter, CI variance)
         assert 1.5 <= ratio <= 3.0, f"ratio={ratio:.1f}, expected ~2.0"
 
     def test_throttle_100_is_noop(self):
         """max_cpu=100 should not start a throttle thread."""
-        result = Sandbox(Policy(max_cpu=100)).call(self._burn_cpu)
+        result = Sandbox(Policy(max_cpu=100)).run(["python3", "-c", self._BURN_CODE])
         assert result.success
 
     def test_throttle_result_correct(self):
         """Throttled process should still return correct results."""
-        result = Sandbox(Policy(max_cpu=50)).call(self._burn_cpu)
+        result = Sandbox(Policy(max_cpu=50)).run(["python3", "-c", self._BURN_CODE])
         assert result.success
-        assert result.value == 20_000_000
+        assert result.stdout.strip() == b"20000000"

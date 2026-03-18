@@ -13,6 +13,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+def _noop_restore(state):
+    """Module-level restore function for checkpoint tests (must be picklable)."""
+    pass
+
+
 from sandlock._checkpoint import (
     Checkpoint,
     TRIGGER_CHECKPOINT,
@@ -234,11 +239,15 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
             app_state=b"test_state",
         )
 
-        with mock.patch("sandlock.sandbox.Sandbox.call") as mock_call:
-            mock_call.return_value = mock.MagicMock(success=True)
+        with mock.patch("sandlock.sandbox.SandboxContext") as mock_ctx:
+            mock_instance = mock.MagicMock()
+            mock_instance.__enter__ = mock.MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = mock.MagicMock(return_value=False)
+            mock_instance.wait.return_value = 0
+            mock_ctx.return_value = mock_instance
             from sandlock.sandbox import Sandbox
-            result = Sandbox.from_checkpoint(cp, lambda state: None)
-            mock_call.assert_called_once()
+            result = Sandbox.from_checkpoint(cp, _noop_restore)
+            mock_ctx.assert_called_once()
 
     def test_from_checkpoint_with_branch(self):
         """from_checkpoint sets parent_branch_path when branch_id is present."""
@@ -253,11 +262,18 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
             workdir="/mnt/ws",
         )
 
-        with mock.patch("sandlock.sandbox.Sandbox.call") as mock_call:
-            mock_call.return_value = mock.MagicMock(success=True)
-            from sandlock.sandbox import Sandbox
-            Sandbox.from_checkpoint(cp, lambda state: None)
-            mock_call.assert_called_once()
+        from sandlock.sandbox import Sandbox
+        with mock.patch("sandlock.sandbox.SandboxContext") as mock_ctx, \
+             mock.patch.object(Sandbox, "_setup_branch", return_value=None), \
+             mock.patch.object(Sandbox, "_finish_branch"), \
+             mock.patch.object(Sandbox, "_cleanup_mount"):
+            mock_instance = mock.MagicMock()
+            mock_instance.__enter__ = mock.MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = mock.MagicMock(return_value=False)
+            mock_instance.wait.return_value = 0
+            mock_ctx.return_value = mock_instance
+            Sandbox.from_checkpoint(cp, _noop_restore)
+            mock_ctx.assert_called_once()
 
     def test_from_checkpoint_without_branch(self):
         """from_checkpoint works without branch info."""
@@ -267,11 +283,15 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
             app_state=b"data",
         )
 
-        with mock.patch("sandlock.sandbox.Sandbox.call") as mock_call:
-            mock_call.return_value = mock.MagicMock(success=True)
+        with mock.patch("sandlock.sandbox.SandboxContext") as mock_ctx:
+            mock_instance = mock.MagicMock()
+            mock_instance.__enter__ = mock.MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = mock.MagicMock(return_value=False)
+            mock_instance.wait.return_value = 0
+            mock_ctx.return_value = mock_instance
             from sandlock.sandbox import Sandbox
-            Sandbox.from_checkpoint(cp, lambda state: None)
-            mock_call.assert_called_once()
+            Sandbox.from_checkpoint(cp, _noop_restore)
+            mock_ctx.assert_called_once()
 
 
 class TestPtraceDataClasses(unittest.TestCase):

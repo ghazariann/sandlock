@@ -6,7 +6,7 @@ clock_gettime/gettimeofday without a real syscall, bypassing seccomp.
 This module patches the vDSO function code to do real syscalls instead,
 so seccomp can intercept them for time virtualization.
 
-For Sandbox.call (no exec): patches in-process via mprotect + write.
+For the forked child (before exec): patches in-process via mprotect + write.
 For Sandbox.run (after exec): patches via /proc/pid/mem with retries,
 since writes only take effect when the child is not in seccomp-stop.
 """
@@ -245,8 +245,8 @@ def disable_vdso_local(mono_offset_s: int = 0) -> None:
     or extra seccomp interception needed).
 
     Call this in the sandbox child before running user code.
-    Only works for Sandbox.call() (no exec). For Sandbox.run(),
-    exec creates a fresh vDSO that needs separate handling.
+    Only works before exec. For Sandbox.run(), exec creates a
+    fresh vDSO that needs separate handling.
     """
     stubs = _build_stubs(mono_offset_s)
     if stubs is None:

@@ -608,7 +608,7 @@ class SandboxContext:
                 if self._policy.no_coredump:
                     import resource
                     # PR_SET_DUMPABLE=0 restricts /proc/pid access and
-                    # disables core dumps.  Effective for Sandbox.call();
+                    # disables core dumps.  Effective before exec;
                     # exec() resets dumpable to 1, so for Sandbox.run()
                     # we also set RLIMIT_CORE=0 which survives exec.
                     _PR_SET_DUMPABLE = 4

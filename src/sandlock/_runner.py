@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""call() implementation: pipe-based result passing for fork+exec sandboxing."""
+"""Runner implementation: pipe-based result passing for fork+exec sandboxing."""
 
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
-import pickle
 import signal
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .exceptions import ChildError, SandboxError
+from .exceptions import SandboxError
 from ._context import SandboxContext
 from .policy import Policy
 
@@ -27,105 +25,16 @@ class Result:
     """Exit code of the child process."""
 
     value: Any = None
-    """Return value from call(), or None for run()."""
+    """Reserved for future use."""
 
     error: str | None = None
     """Error message if the child failed."""
 
     stdout: bytes = field(default=b"", repr=False)
-    """Captured stdout (for run() only)."""
+    """Captured stdout."""
 
     stderr: bytes = field(default=b"", repr=False)
-    """Captured stderr (for run() only)."""
-
-
-def call_in_sandbox(
-    fn: Callable,
-    args: tuple,
-    policy: Policy,
-    sandbox_id: str,
-    *,
-    timeout: float | None = None,
-) -> Result:
-    """Run *fn(*args)* in a forked, sandboxed child process.
-
-    Results are passed back via an inherited pipe fd.
-
-    Args:
-        fn: Callable to execute.
-        args: Positional arguments for *fn*.
-        policy: Sandbox policy.
-        sandbox_id: Unique sandbox identifier.
-        timeout: Maximum seconds to wait for the child.
-
-    Returns:
-        Result with the return value or error.
-    """
-    read_fd, write_fd = os.pipe()
-
-    def _target() -> None:
-        os.close(read_fd)
-        try:
-            value = fn(*args)
-            _write_result_fd(write_fd, {"ok": True, "value": value})
-        except BaseException as exc:
-            _write_result_fd(
-                write_fd, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            )
-        finally:
-            os.close(write_fd)
-
-    # Use a non-closing-fds policy for the inner target since we need the pipe
-    inner_policy = dataclasses.replace(policy, close_fds=False)
-    # Propagate branch attrs (not dataclass fields, lost by replace)
-    for attr in ('_overlay_branch', '_cow_branch'):
-        val = getattr(policy, attr, None)
-        if val is not None:
-            object.__setattr__(inner_policy, attr, val)
-
-    try:
-        with SandboxContext(
-            _target,
-            inner_policy,
-            sandbox_id,
-        ) as ctx:
-            os.close(write_fd)
-            write_fd = -1  # prevent double-close
-            try:
-                exit_code = ctx.wait(timeout=timeout)
-            except TimeoutError:
-                ctx.abort()
-                _drain_and_close(read_fd)
-                return Result(
-                    success=False,
-                    exit_code=-1,
-                    error="Sandbox timed out",
-                )
-    except Exception as e:
-        if write_fd >= 0:
-            os.close(write_fd)
-        _drain_and_close(read_fd)
-        return Result(success=False, exit_code=-1, error=str(e))
-
-    # Read result from pipe
-    data = _read_result_fd(read_fd)
-    os.close(read_fd)
-
-    if data is None:
-        return Result(
-            success=False,
-            exit_code=exit_code,
-            error="Child process did not produce a result (possibly OOM-killed)",
-        )
-
-    if data.get("ok"):
-        return Result(success=True, exit_code=0, value=data.get("value"))
-
-    return Result(
-        success=False,
-        exit_code=exit_code,
-        error=data.get("error", "unknown child error"),
-    )
+    """Captured stderr."""
 
 
 def run_interactive_in_sandbox(
@@ -285,31 +194,6 @@ def run_command_in_sandbox(
 
 
 # --- Pipe helpers ---
-
-def _write_result_fd(fd: int, data: dict) -> None:
-    """Write a JSON result dict to a pipe fd."""
-    try:
-        payload = json.dumps(data).encode()
-    except (TypeError, ValueError):
-        fallback = dict(data)
-        if "value" in fallback:
-            fallback["value"] = repr(fallback["value"])
-        payload = json.dumps(fallback).encode()
-    os.write(fd, payload)
-
-
-def _read_result_fd(fd: int) -> dict | None:
-    """Read a JSON result dict from a pipe fd.  Returns None on empty read."""
-    chunks = []
-    while True:
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    if not chunks:
-        return None
-    return json.loads(b"".join(chunks))
-
 
 def _read_all_fd(fd: int) -> bytes:
     """Read all data from a file descriptor."""
