@@ -424,8 +424,7 @@ class NotifSupervisor:
         # Deterministic time
         self._time_offset = None  # TimeOffset | None
         self._mono_offset_s: int = 0  # monotonic offset for vDSO stubs
-        self._vdso_patch_fd: int = -1   # pre-opened /proc/pid/mem
-        self._vdso_patch_writes: list[tuple[int, bytes]] = []  # (offset, stub)
+        self._vdso_patched_addr: int = 0  # vDSO base address we last patched
         self._virtual_btime: int = 0  # virtual boot time for /proc/stat
         if policy.time_start is not None:
             import time as _time
@@ -556,6 +555,12 @@ class NotifSupervisor:
         if ret < 0:
             return  # ENOENT = child died, EINTR = interrupted
 
+        # Patch vDSO before dispatching (child is stopped in seccomp
+        # notification state, so /proc/pid/mem writes are reliable).
+        # Re-patch when the vDSO address changes (exec replaces the vDSO).
+        if self._time_offset is not None:
+            self._maybe_patch_vdso(notif.pid)
+
         try:
             self._dispatch(notif)
         except Exception:
@@ -566,52 +571,44 @@ class NotifSupervisor:
             except Exception:
                 pass
 
-        # Post-dispatch: patch vDSO for new PIDs (after exec).
-        # Two-phase approach:
-        #   Phase 1 (this notification): pre-compute — open fd, parse
-        #     vDSO ELF, compute offsets.  This is slow but the child
-        #     will be unfrozen when dispatch responds above.
-        #   Phase 2 (next notification): minimal lseek+write using the
-        #     pre-computed fd and offsets.  Fast enough to land while
-        #     the child is briefly running after the previous response.
-        if self._vdso_patch_writes:
-            # Phase 2: fast write (child briefly running after respond)
-            fd = self._vdso_patch_fd
-            for off, stub in self._vdso_patch_writes:
-                os.lseek(fd, off, os.SEEK_SET)
-                os.write(fd, stub)
-            os.close(fd)
-            self._vdso_patch_fd = -1
-            self._vdso_patch_writes = []
-        elif self._time_offset is not None and self._vdso_patch_fd == -1:
-            # Phase 1: pre-compute (first notification from new PID)
-            pid = notif.pid
-            from ._vdso import _find_vdso, _parse_vdso_symbols, _get_stubs
-            info = _find_vdso(pid)
-            stubs = _get_stubs(self._mono_offset_s)
-            if info and stubs:
-                addr, size = info
-                try:
-                    fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
-                    os.lseek(fd, addr, os.SEEK_SET)
-                    data = os.read(fd, size)
-                    writes = []
-                    for name, off in _parse_vdso_symbols(data):
-                        stub = stubs.get(name)
-                        if stub:
-                            writes.append((addr + off, stub))
-                    if writes:
-                        self._vdso_patch_fd = fd
-                        self._vdso_patch_writes = writes
-                    else:
-                        os.close(fd)
-                except OSError:
-                    pass
-
     @property
     def tracked_pids(self) -> set[int]:
         """All PIDs known to belong to this sandbox."""
         return set(self._proc_pids)
+
+    def _maybe_patch_vdso(self, pid: int) -> None:
+        """Patch the child's vDSO to force real syscalls, if needed.
+
+        Called while the child is stopped in seccomp notification state,
+        so /proc/pid/mem writes land reliably before the child resumes.
+        Tracks the vDSO base address to detect exec (which replaces the
+        vDSO at a new address) and re-patch automatically.
+        """
+        from ._vdso import _find_vdso, _parse_vdso_symbols, _get_stubs
+        info = _find_vdso(pid)
+        if not info:
+            return
+        addr, size = info
+        if addr == self._vdso_patched_addr:
+            return  # already patched this vDSO
+        stubs = _get_stubs(self._mono_offset_s)
+        if not stubs:
+            return
+        try:
+            fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
+            try:
+                os.lseek(fd, addr, os.SEEK_SET)
+                data = os.read(fd, size)
+                for name, off in _parse_vdso_symbols(data):
+                    stub = stubs.get(name)
+                    if stub:
+                        os.lseek(fd, addr + off, os.SEEK_SET)
+                        os.write(fd, stub)
+                self._vdso_patched_addr = addr
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
 
     def _dispatch(self, notif: SeccompNotif) -> None:
         """Route a notification to the appropriate handler."""

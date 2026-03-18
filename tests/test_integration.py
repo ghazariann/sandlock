@@ -1323,7 +1323,7 @@ print('OK')
 # --- Deterministic time ---
 
 class TestDeterministicTime:
-    @pytest.mark.xfail(reason="vDSO patching via /proc/pid/mem is racy for exec'd processes")
+
     def test_time_start_accepts_unix_timestamp(self):
         """time_start accepts a numeric Unix timestamp."""
         # 946684800 = 2000-01-01T00:00:00Z
@@ -1399,7 +1399,7 @@ class TestDeterministicTime:
         mono = float(result.stdout.strip())
         assert mono < 5.0, f"Monotonic too high: {mono}"
 
-    @pytest.mark.xfail(reason="vDSO patching via /proc/pid/mem is racy for exec'd processes")
+
     def test_time_syscall_shifted_run_ctypes(self):
         """time() syscall is shifted (used by uptime, w, etc.)."""
         policy = Policy(
@@ -1408,8 +1408,8 @@ class TestDeterministicTime:
         )
         result = Sandbox(policy).run(
             ["python3", "-c",
-             "import ctypes, ctypes.util; "
-             "libc = ctypes.CDLL(ctypes.util.find_library('c')); "
+             "import ctypes; "
+             "libc = ctypes.CDLL(None); "
              "libc.time.restype = ctypes.c_long; "
              "print(libc.time(0))"]
         )
@@ -1448,12 +1448,12 @@ class TestDeterministicTime:
         btime = int(result.stdout.strip().split()[1])
         assert btime == 946684800, f"btime not virtualized: {btime}"
 
-    @pytest.mark.xfail(reason="vDSO patching via /proc/pid/mem is racy for exec'd processes")
+
     def test_timerfd_abstime_works(self):
         """timerfd_settime with TFD_TIMER_ABSTIME fires correctly."""
         code = (
-            "import ctypes, ctypes.util, struct, os, time\n"
-            "libc = ctypes.CDLL(ctypes.util.find_library('c'))\n"
+            "import ctypes, struct, os, time\n"
+            "libc = ctypes.CDLL(None)\n"
             "CLOCK_MONOTONIC = 1\n"
             "TFD_TIMER_ABSTIME = 1\n"
             "fd = libc.timerfd_create(CLOCK_MONOTONIC, 0)\n"

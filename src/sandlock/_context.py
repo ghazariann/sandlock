@@ -475,6 +475,10 @@ class SandboxContext:
         # just sys.modules lookups.
         if use_notif:
             from ._notif import install_notif_filter, send_fd  # noqa: F811
+        if (self._notif_policy is not None
+                and self._notif_policy.time_start is not None):
+            import time as _time  # noqa: F811
+            from ._vdso import disable_vdso_local  # noqa: F811
         if self._save_fn is not None:
             from ._checkpoint import start_child_listener  # noqa: F811
         # User namespace is needed for privileged mode or overlayfs

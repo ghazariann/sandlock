@@ -7,8 +7,8 @@ This module patches the vDSO function code to do real syscalls instead,
 so seccomp can intercept them for time virtualization.
 
 For the forked child (before exec): patches in-process via mprotect + write.
-For Sandbox.run (after exec): patches via /proc/pid/mem with retries,
-since writes only take effect when the child is not in seccomp-stop.
+For Sandbox.run (after exec): patches via /proc/pid/mem while the child
+is stopped in seccomp notification state, ensuring reliable delivery.
 """
 
 from __future__ import annotations
