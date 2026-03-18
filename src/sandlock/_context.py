@@ -475,17 +475,12 @@ class SandboxContext:
             from ._notif import install_notif_filter, send_fd  # noqa: F811
         if self._save_fn is not None:
             from ._checkpoint import start_child_listener  # noqa: F811
-        # User namespace is needed for privileged mode, overlayfs, or
-        # time namespace (CLONE_NEWTIME requires user namespace)
+        # User namespace is needed for privileged mode or overlayfs
         from .policy import FsIsolation
         needs_overlay = self._policy.fs_isolation == FsIsolation.OVERLAYFS
-        needs_time_ns = (self._notif_policy is not None
-                         and self._notif_policy.time_start is not None)
-        needs_userns = self._policy.privileged or needs_overlay or needs_time_ns
+        needs_userns = self._policy.privileged or needs_overlay
         if needs_userns:
             from ._userns import unshare_user, setup_userns_in_parent, userns_available  # noqa: F811
-        if needs_time_ns:
-            from ._userns import write_timens_offsets, enter_timens  # noqa: F811
 
         # Sync pipes for user namespace setup:
         #   child_to_parent: child signals "I've unshared"
@@ -555,7 +550,7 @@ class SandboxContext:
                     os.close(userns_c2p_r)
                     os.close(userns_p2c_w)
                     try:
-                        unshare_user(time_ns=needs_time_ns)
+                        unshare_user()
                         os.write(userns_c2p_w, b"1")  # Tell parent: unshared
                         os.close(userns_c2p_w)
                         os.read(userns_p2c_r, 1)       # Wait: maps written
@@ -567,20 +562,6 @@ class SandboxContext:
                         if self._policy.strict and self._policy.privileged:
                             raise ConfinementError(
                                 "User namespace unavailable and policy.privileged=True"
-                            )
-
-                # 1a. Time namespace offsets (must be written before
-                #      any process enters the namespace via exec/setns)
-                if needs_time_ns:
-                    import time as _time
-                    mono_offset = -int(_time.monotonic())
-                    try:
-                        write_timens_offsets(mono_offset, mono_offset)
-                        enter_timens()
-                    except OSError:
-                        if self._policy.strict:
-                            raise ConfinementError(
-                                "Time namespace setup failed"
                             )
 
                 # 1b. Mount namespace + overlayfs (if needed)
@@ -754,8 +735,10 @@ class SandboxContext:
                 # 9b. Disable vDSO for time virtualization
                 if (self._notif_policy is not None
                         and self._notif_policy.time_start is not None):
+                    import time as _time
                     from ._vdso import disable_vdso_local
-                    disable_vdso_local()
+                    mono_offset = -int(_time.monotonic())
+                    disable_vdso_local(mono_offset_s=mono_offset)
 
                 # 9c. Limit open file descriptors (after all setup fds are closed)
                 if self._policy.max_open_files is not None:

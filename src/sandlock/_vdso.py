@@ -17,23 +17,115 @@ import ctypes
 import os
 import struct
 
-# x86_64: per-function stubs that do real syscalls.
-# Each stub: mov eax, <nr>; syscall; ret  — 8 bytes
-_STUBS_X86_64 = {
-    b"clock_gettime": b"\xb8\xe4\x00\x00\x00\x0f\x05\xc3",       # nr=228
-    b"__vdso_clock_gettime": b"\xb8\xe4\x00\x00\x00\x0f\x05\xc3",
-    b"gettimeofday": b"\xb8\x60\x00\x00\x00\x0f\x05\xc3",        # nr=96
-    b"__vdso_gettimeofday": b"\xb8\x60\x00\x00\x00\x0f\x05\xc3",
-}
+# Simple stubs that just force a real syscall (no offset).
+# Used for gettimeofday and when no monotonic offset is needed.
+_SIMPLE_STUB_X86_64 = b"\xb8{nr}\x0f\x05\xc3"   # mov eax,<nr>; syscall; ret (8 bytes)
+_SIMPLE_STUB_AARCH64 = b"\x01\x00\x00\xd4\xc0\x03\x5f\xd6"  # svc #0; ret (8 bytes)
 
-# aarch64: svc #0; ret  — 8 bytes
-# The caller already has the syscall number in x8.
-_STUBS_AARCH64 = {
-    b"clock_gettime": b"\x01\x00\x00\xd4\xc0\x03\x5f\xd6",
-    b"__kernel_clock_gettime": b"\x01\x00\x00\xd4\xc0\x03\x5f\xd6",
-    b"gettimeofday": b"\x01\x00\x00\xd4\xc0\x03\x5f\xd6",
-    b"__kernel_gettimeofday": b"\x01\x00\x00\xd4\xc0\x03\x5f\xd6",
-}
+
+def _clock_gettime_stub_x86_64(mono_offset_s: int = 0) -> bytes:
+    """Build a clock_gettime vDSO stub for x86_64.
+
+    If mono_offset_s == 0, returns a simple syscall stub (8 bytes).
+    If mono_offset_s != 0, returns a 35-byte stub that:
+      1. Does a real syscall (so seccomp can intercept REALTIME)
+      2. For non-REALTIME clocks, adds mono_offset_s to tv_sec
+    """
+    if mono_offset_s == 0:
+        return b"\xb8\xe4\x00\x00\x00\x0f\x05\xc3"  # nr=228
+
+    # push rdi;  push rsi;  mov eax,228;  syscall;  pop rsi;  pop rdi
+    # cmp edi,0;  je done;  cmp edi,5;  je done
+    # movabs rcx,<offset>;  add [rsi],rcx;  done: ret
+    return (
+        b"\x57"                           # push rdi
+        b"\x56"                           # push rsi
+        b"\xb8\xe4\x00\x00\x00"           # mov eax, 228
+        b"\x0f\x05"                       # syscall
+        b"\x5e"                           # pop rsi
+        b"\x5f"                           # pop rdi
+        b"\x83\xff\x00"                   # cmp edi, 0  (CLOCK_REALTIME)
+        b"\x74\x12"                       # je +18 → ret
+        b"\x83\xff\x05"                   # cmp edi, 5  (CLOCK_REALTIME_COARSE)
+        b"\x74\x0d"                       # je +13 → ret
+        b"\x48\xb9" + struct.pack("<q", mono_offset_s) +  # movabs rcx, <offset>
+        b"\x48\x01\x0e"                   # add [rsi], rcx
+        b"\xc3"                           # ret
+    )
+
+
+def _clock_gettime_stub_aarch64(mono_offset_s: int = 0) -> bytes:
+    """Build a clock_gettime vDSO stub for aarch64.
+
+    If mono_offset_s == 0, returns a simple syscall stub (8 bytes).
+    If mono_offset_s != 0, returns a stub that:
+      1. Does a real syscall (svc #0)
+      2. For non-REALTIME clocks, adds mono_offset_s to tv_sec
+    """
+    if mono_offset_s == 0:
+        return _SIMPLE_STUB_AARCH64
+
+    # On entry: x0 = clockid, x1 = timespec*
+    # svc #0                 ; real syscall (x8 already has NR)
+    # cmp w0, #0             ; CLOCK_REALTIME?     -- wait, x0 is return value after svc
+    # Actually after svc, x0 = return value, original x0 (clockid) is lost.
+    # Need to save it first.
+    #
+    # stp x0, x1, [sp, #-16]!  ; save clockid, timespec*
+    # svc #0                    ; syscall
+    # ldp x2, x1, [sp], #16    ; x2=clockid, x1=timespec*
+    # cmp w2, #0                ; CLOCK_REALTIME?
+    # b.eq done
+    # cmp w2, #5                ; CLOCK_REALTIME_COARSE?
+    # b.eq done
+    # ldr x3, [x1]              ; tv_sec
+    # ldr x4, offset_val        ; load offset
+    # add x3, x3, x4
+    # str x3, [x1]              ; store tv_sec
+    # ret                       ; done:
+    # offset_val: .quad <offset>
+
+    off_bytes = struct.pack("<q", mono_offset_s)
+    return (
+        b"\xe0\x07\xbf\xa9"    # stp x0, x1, [sp, #-16]!
+        b"\x01\x00\x00\xd4"    # svc #0
+        b"\xe2\x07\xc1\xa8"    # ldp x2, x1, [sp], #16
+        b"\x5f\x00\x00\x71"    # cmp w2, #0
+        b"\x80\x00\x00\x54"    # b.eq +16 → ret
+        b"\x5f\x14\x00\x71"    # cmp w2, #5
+        b"\x60\x00\x00\x54"    # b.eq +12 → ret
+        b"\x23\x00\x40\xf9"    # ldr x3, [x1]
+        b"\x64\x00\x00\x58"    # ldr x4, +12 (offset_val)
+        b"\x63\x00\x04\x8b"    # add x3, x3, x4
+        b"\x23\x00\x00\xf9"    # str x3, [x1]
+        b"\xc0\x03\x5f\xd6"    # ret
+        + off_bytes            # offset_val: .quad <offset>
+    )
+
+
+def _build_stubs(mono_offset_s: int = 0) -> dict[bytes, bytes] | None:
+    """Build stub map for the current architecture."""
+    import platform
+    arch = platform.machine()
+
+    if arch == "x86_64":
+        cgt = _clock_gettime_stub_x86_64(mono_offset_s)
+        gtod = b"\xb8\x60\x00\x00\x00\x0f\x05\xc3"  # nr=96 simple stub
+        return {
+            b"clock_gettime": cgt,
+            b"__vdso_clock_gettime": cgt,
+            b"gettimeofday": gtod,
+            b"__vdso_gettimeofday": gtod,
+        }
+    elif arch == "aarch64":
+        cgt = _clock_gettime_stub_aarch64(mono_offset_s)
+        return {
+            b"clock_gettime": cgt,
+            b"__kernel_clock_gettime": cgt,
+            b"gettimeofday": _SIMPLE_STUB_AARCH64,
+            b"__kernel_gettimeofday": _SIMPLE_STUB_AARCH64,
+        }
+    return None
 
 _libc = ctypes.CDLL(None, use_errno=True)
 
@@ -139,25 +231,20 @@ def _parse_vdso_symbols(data: bytes) -> list[tuple[bytes, int]]:
     return results
 
 
-def disable_vdso_local() -> None:
+def disable_vdso_local(mono_offset_s: int = 0) -> None:
     """Patch the vDSO in the current process to force real syscalls.
 
     Replaces vDSO clock_gettime/gettimeofday code with stubs that
-    do real syscalls (mov eax, NR; syscall; ret). This forces all
-    time calls through the kernel where seccomp can intercept them.
+    do real syscalls. If mono_offset_s is nonzero, the clock_gettime
+    stub also applies a monotonic/boottime offset inline (no namespace
+    or extra seccomp interception needed).
 
     Call this in the sandbox child before running user code.
     Only works for Sandbox.call() (no exec). For Sandbox.run(),
     exec creates a fresh vDSO that needs separate handling.
     """
-    import platform
-
-    arch = platform.machine()
-    if arch == "x86_64":
-        stubs = _STUBS_X86_64
-    elif arch == "aarch64":
-        stubs = _STUBS_AARCH64
-    else:
+    stubs = _build_stubs(mono_offset_s)
+    if stubs is None:
         return
 
     info = _find_vdso()
@@ -193,12 +280,6 @@ def disable_vdso_local() -> None:
     )
 
 
-def _get_stubs() -> dict[bytes, bytes] | None:
+def _get_stubs(mono_offset_s: int = 0) -> dict[bytes, bytes] | None:
     """Return the per-function stub map for the current architecture."""
-    import platform
-    arch = platform.machine()
-    if arch == "x86_64":
-        return _STUBS_X86_64
-    elif arch == "aarch64":
-        return _STUBS_AARCH64
-    return None
+    return _build_stubs(mono_offset_s)

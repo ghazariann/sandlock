@@ -17,7 +17,6 @@ import os
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 CLONE_NEWUSER = 0x10000000
-CLONE_NEWTIME = 0x00000080
 
 
 def setup_userns_in_parent(child_pid: int, privileged: bool = False) -> None:
@@ -40,62 +39,19 @@ def setup_userns_in_parent(child_pid: int, privileged: bool = False) -> None:
     _write_id_map(f"/proc/{child_pid}/gid_map", inner_gid, gid, 1)
 
 
-def unshare_user(time_ns: bool = False) -> None:
+def unshare_user() -> None:
     """Create a new user namespace via unshare(2).
 
     After this call (and after the parent writes uid/gid maps),
     the process has CAP_SYS_ADMIN in the new user namespace.
 
-    Args:
-        time_ns: Also create a time namespace (CLONE_NEWTIME).
-                 Offsets must be written before exec/setns enters it.
-
     Raises:
         OSError: If unshare fails (e.g. kernel.unprivileged_userns_clone=0).
     """
-    flags = CLONE_NEWUSER | (CLONE_NEWTIME if time_ns else 0)
-    ret = _libc.unshare(ctypes.c_int(flags))
+    ret = _libc.unshare(ctypes.c_int(CLONE_NEWUSER))
     if ret < 0:
         err = ctypes.get_errno()
-        raise OSError(err, f"unshare({flags:#x}): {os.strerror(err)}")
-
-
-def write_timens_offsets(monotonic_offset_s: int, boottime_offset_s: int = 0) -> None:
-    """Write monotonic/boottime offsets to /proc/self/timens_offsets.
-
-    Must be called after unshare(CLONE_NEWTIME) and before any
-    process enters the new namespace (via exec or setns).
-    """
-    with open("/proc/self/timens_offsets", "w") as f:
-        if monotonic_offset_s != 0:
-            f.write(f"monotonic {monotonic_offset_s} 0\n")
-        if boottime_offset_s != 0:
-            f.write(f"boottime {boottime_offset_s} 0\n")
-
-
-def enter_timens() -> None:
-    """Enter the time namespace created by unshare(CLONE_NEWTIME).
-
-    After unshare, the current process stays in the old namespace.
-    This uses setns on /proc/self/ns/time_for_children to enter it
-    without exec.  Needed for Sandbox.call() (no exec).
-    """
-    import platform
-    arch = platform.machine()
-    NR_SETNS = {"x86_64": 308, "aarch64": 268}.get(arch)
-    if NR_SETNS is None:
-        raise OSError(0, f"setns: unsupported architecture {arch}")
-
-    fd = os.open("/proc/self/ns/time_for_children", os.O_RDONLY)
-    try:
-        ret = _libc.syscall(ctypes.c_long(NR_SETNS),
-                            ctypes.c_int(fd),
-                            ctypes.c_int(CLONE_NEWTIME))
-        if ret < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, f"setns(NEWTIME): {os.strerror(err)}")
-    finally:
-        os.close(fd)
+        raise OSError(err, f"unshare(NEWUSER): {os.strerror(err)}")
 
 
 def userns_available() -> bool:

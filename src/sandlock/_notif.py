@@ -423,11 +423,14 @@ class NotifSupervisor:
             self._det_random = DeterministicRandom(policy.random_seed)
         # Deterministic time
         self._time_offset = None  # TimeOffset | None
+        self._mono_offset_s: int = 0  # monotonic offset for vDSO stubs
         self._vdso_patch_fd: int = -1   # pre-opened /proc/pid/mem
         self._vdso_patch_writes: list[tuple[int, bytes]] = []  # (offset, stub)
         if policy.time_start is not None:
+            import time as _time
             from ._time import TimeOffset
             self._time_offset = TimeOffset(policy.time_start)
+            self._mono_offset_s = -int(_time.monotonic())
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
         # Resource state (memory, process count, fork-hold)
@@ -583,7 +586,7 @@ class NotifSupervisor:
             pid = notif.pid
             from ._vdso import _find_vdso, _parse_vdso_symbols, _get_stubs
             info = _find_vdso(pid)
-            stubs = _get_stubs()
+            stubs = _get_stubs(self._mono_offset_s)
             if info and stubs:
                 addr, size = info
                 try:
