@@ -68,6 +68,12 @@ sandlock run --net-bind 8080 --net-connect 443 -r /usr -r /lib -r /etc -- python
 sandlock run --isolate-ipc --isolate-signals --clean-env --env CC=gcc \
   -r /usr -r /lib -w /tmp -- make
 
+# Deterministic execution (frozen time + seeded randomness)
+sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 -- ./build.sh
+
+# Port virtualization (multiple sandboxes can bind the same port)
+sandlock run -i --port-remap -r /usr -r /lib -r /etc -- redis-server --port 6379
+
 # Use a saved profile (CLI flags override profile values)
 sandlock run -p build -- make -j4
 sandlock run -p build --max-memory 1G -- make
@@ -115,10 +121,6 @@ policy = Policy(
 # Run a command
 result = Sandbox(policy).run(["python3", "-c", "print('hello')"])
 
-# Run a Python function
-result = Sandbox(policy).call(lambda: sum(range(1_000_000)))
-print(result.value)  # 499999500000
-
 # Use a saved TOML profile
 result = Sandbox("build").run(["make", "-j4"])
 ```
@@ -135,7 +137,7 @@ with Sandbox(policy) as sb:
 
 # Nested: child inherits parent's constraints
 with Sandbox(parent_policy) as parent:
-    result = parent.sandbox(child_policy).call(untrusted_fn)
+    result = parent.sandbox(child_policy).run(["python3", "untrusted.py"])
 ```
 
 ## Architecture
@@ -154,7 +156,7 @@ Parent                              Child
   │                                   │     └─ send notify fd ──────> Parent
   │  receive notify fd                ├─ 7. Close fds 3+
   │  start supervisor thread          ├─ 8. Environment (clean_env + env)
-  │  pidfd_open() + poll()            └─ 9. exec(cmd) or target()
+  │  pidfd_open() + poll()            └─ 9. exec(cmd)
 ```
 
 Each layer is **defense-in-depth**: bypassing one doesn't defeat the others.
@@ -192,6 +194,7 @@ Enforced via **seccomp user notification** and **SIGSTOP/SIGCONT**, no cgroups o
 | Memory | seccomp notif on `mmap`/`munmap`/`brk`/`mremap` | `ENOMEM` when over budget |
 | Processes | seccomp notif on `clone`/`fork`/`vfork` | `EAGAIN` when at limit |
 | CPU | Parent-side SIGSTOP/SIGCONT on process group | Throttle to N% of one core |
+| Open files | `RLIMIT_NOFILE` | Kernel-enforced fd limit |
 | Disk | BranchFS FUSE layer (`--max-disk`) | `ENOSPC` when quota exceeded |
 | Ports | seccomp notif on `bind`/`connect` | Virtualize ports outside `net_bind` range |
 
@@ -208,14 +211,15 @@ same port without conflicts — no configuration needed.
 ```python
 policy = Policy(port_remap=True)
 
-Sandbox(policy).call(start_web_server)   # bind(3000) -> kernel picks a free real port
-Sandbox(policy).call(start_web_server)   # bind(3000) -> different real port, no conflict
+Sandbox(policy).run(["python3", "server.py"])   # bind(3000) -> direct bind
+Sandbox(policy).run(["python3", "server.py"])   # bind(3000) -> remapped, no conflict
 ```
 
-The supervisor intercepts `bind()`/`connect()` via seccomp notif, allocates a
-free real port from the kernel on demand, and rewrites the sockaddr in child
-memory.  `getsockname()` returns the virtual port.  No port ranges to configure,
-no network namespaces, no root required.
+The supervisor intercepts `bind()`/`connect()` via seccomp notif.  When a port
+is free, the sandbox binds it directly (zero data-path overhead).  When there is
+a conflict, a different real port is allocated and traffic is forwarded via a
+zero-copy splice proxy.  `getsockname()` returns the virtual port.  No port
+ranges to configure, no network namespaces, no root required.
 
 Optionally, `net_bind`/`net_connect` restrict which virtual ports the sandbox
 may use (Landlock enforcement, defense-in-depth).
@@ -270,6 +274,29 @@ Two backends:
 
 Nested sandboxes create child COW layers automatically.
 
+### Deterministic Execution
+
+Pin time, randomness, and memory layout for reproducible builds and tests:
+
+```python
+Policy(
+    time_start="2000-01-01T00:00:00Z",  # Frozen wall clock + monotonic near zero
+    random_seed=42,                      # Deterministic getrandom()
+    no_randomize_memory=True,            # Disable ASLR
+    no_huge_pages=True,                  # Consistent page sizes
+    no_coredump=True,                    # Disable core dumps
+)
+```
+
+```bash
+sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 \
+  --no-randomize-memory --no-huge-pages -- ./build.sh
+```
+
+Time virtualization intercepts `clock_gettime`/`gettimeofday`/`time` via seccomp
+notification and patches the vDSO to force real syscalls.  `/proc/uptime` and
+`/proc/stat` btime are also virtualized.
+
 ### Checkpoint/Restore
 
 Two-layer checkpoint without CRIU or root:
@@ -321,8 +348,16 @@ class Policy:
     # Resources (seccomp notif + SIGSTOP/SIGCONT)
     max_memory: str | int | None = None  # '512M'
     max_processes: int = 64              # per-sandbox fork count
-    max_cpu: int | None = None            # 50 = 50% of one core (SIGSTOP/SIGCONT)
+    max_cpu: int | None = None           # 50 = 50% of one core (SIGSTOP/SIGCONT)
+    max_open_files: int | None = None    # RLIMIT_NOFILE
     port_remap: bool = False             # Full virtual port space per sandbox
+
+    # Deterministic execution
+    time_start: float | str | None = None    # '2000-01-01T00:00:00Z' or Unix timestamp
+    random_seed: int | None = None           # Deterministic getrandom()
+    no_randomize_memory: bool = False        # Disable ASLR
+    no_huge_pages: bool = False              # Disable THP
+    no_coredump: bool = False                # Disable core dumps
 
     # Environment
     clean_env: bool = False              # Minimal env (PATH, HOME, TERM, LANG, USER, SHELL)
