@@ -412,14 +412,38 @@ def start_child_listener(
 TRIGGER_FORK = b"\x03"
 
 
+import ctypes as _ctypes
+import ctypes.util as _ctypes_util
+import platform as _platform
+
+_libc = _ctypes.CDLL(_ctypes_util.find_library("c"), use_errno=True)
+_libc.syscall.restype = _ctypes.c_long
+_NR_FORK = 57 if _platform.machine() == "x86_64" else None
+
+
+def _raw_fork() -> int:
+    """Raw fork(2) syscall, bypassing glibc clone() wrapper.
+
+    Python's ``os.fork()`` uses ``clone``, which seccomp intercepts
+    via USER_NOTIF for process counting.  The ``fork`` syscall (NR 57)
+    is NOT intercepted, so it goes straight through BPF.
+    """
+    if _NR_FORK is None:
+        return os.fork()
+    pid = _libc.syscall(_ctypes.c_long(_NR_FORK))
+    if pid < 0:
+        err = _ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return pid
+
+
 def clone_ready_loop(control_fd: int, work_fn: "Callable") -> None:
     """Main-thread loop: wait for fork commands, fork and run work_fn.
 
     After init_fn returns, the main thread enters this loop.  It blocks
     on ``os.read()`` (GIL released), so no CPU is wasted.  When the
-    parent sends TRIGGER_FORK, the main thread calls ``os.fork()`` —
-    giving the clone a full COW copy of all memory (including
-    everything init_fn set up in globals/heap).
+    parent sends TRIGGER_FORK, the main thread calls raw ``fork(2)``
+    (not ``os.fork()``), bypassing the seccomp USER_NOTIF round-trip.
 
     Args:
         control_fd: Child's end of the control socket.
@@ -450,7 +474,7 @@ def clone_ready_loop(control_fd: int, work_fn: "Callable") -> None:
                 pass
 
             try:
-                pid = os.fork()
+                pid = _raw_fork()
             except OSError:
                 os.write(control_fd, struct.pack(">I", 0))
                 continue

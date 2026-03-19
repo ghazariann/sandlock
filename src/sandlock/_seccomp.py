@@ -285,16 +285,25 @@ def _build_arg_filters() -> bytes:
     These filters check specific arguments rather than blocking the
     syscall entirely:
 
-    - ioctl(2): Block TIOCSTI (terminal input injection).  Normal
-      terminal I/O and isatty() still work.
-
-    Note: clone/clone3 namespace flag checks are handled in the
-    supervisor via USER_NOTIF, not here.
+    - clone(2): Block namespace flags (CLONE_NEW*) with ERRNO.
+      Plain forks fall through to the main filter (USER_NOTIF if
+      clone is in the notif list, or ALLOW if not).
+    - ioctl(2): Block TIOCSTI (terminal input injection).
     """
     insns = bytearray()
 
-    # --- clone/clone3: handled via USER_NOTIF (namespace flag checks
-    #     and process tracking done in supervisor) ---
+    # --- clone: block namespace creation flags ---
+    nr_clone = _SYSCALL_NR.get("clone")
+    if nr_clone is not None:
+        # Load syscall number
+        insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
+        # if nr != clone, skip this block (3 instructions ahead)
+        insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr_clone, 0, 3)
+        # Load clone flags (arg0, low 32 bits)
+        insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO)
+        # Test: flags & NS_FLAGS → ERRNO if set, fall through if not
+        insns += _bpf_jump(BPF_JMP | BPF_JSET | BPF_K, _CLONE_NS_FLAGS, 0, 1)
+        insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
 
     # --- ioctl: block TIOCSTI (terminal input injection) ---
     # Load syscall number

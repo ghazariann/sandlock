@@ -95,5 +95,58 @@ class TestRequestForkProtocol(unittest.TestCase):
             child.close()
 
 
+class TestMaxProcessesInClone(unittest.TestCase):
+    """Verify that max_processes is enforced inside COW clones.
+
+    The template uses raw fork(2) to bypass seccomp USER_NOTIF, but
+    clones inherit the seccomp filter that intercepts clone (os.fork).
+    Process limits must still be enforced in work().
+    """
+
+    def test_clone_inherits_process_limit(self):
+        """work() cannot fork more than max_processes allows."""
+        import sys
+        import tempfile
+
+        marker = tempfile.mktemp(prefix="sandlock_test_maxproc_")
+
+        def init():
+            pass
+
+        def work():
+            count = 0
+            for _ in range(20):
+                try:
+                    pid = os.fork()
+                    if pid == 0:
+                        os._exit(0)
+                    os.waitpid(pid, 0)
+                    count += 1
+                except OSError:
+                    break
+            with open(marker, "w") as f:
+                f.write(str(count))
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=[sys.prefix, "/usr", "/lib", "/etc", "/proc", "/dev"],
+            max_processes=5,
+        )
+
+        with Sandbox(policy, init, work) as sb:
+            sb.fork().wait(timeout=10)
+
+        self.assertTrue(os.path.exists(marker))
+        count = int(open(marker).read())
+        os.unlink(marker)
+
+        # max_processes=5: the template's raw fork counts as 1 (via
+        # the supervisor tracking clone3/vfork), so the clone can
+        # fork at most 4 more times.  The exact count depends on
+        # how the supervisor counts, but it must be less than 20.
+        self.assertLess(count, 20, "max_processes not enforced in clone")
+        self.assertGreater(count, 0, "clone couldn't fork at all")
+
+
 if __name__ == "__main__":
     unittest.main()

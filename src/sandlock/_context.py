@@ -97,10 +97,15 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
     names = ["openat"]
     if "open" in _SYSCALL_NR:
         names.append("open")
-    # Always intercept clone/fork/vfork/clone3 — the supervisor checks
-    # namespace flags (which BPF can't inspect for clone3) and tracks
-    # process creation.
-    names.extend(["clone", "clone3", "fork", "vfork"])
+    # Intercept clone/clone3/vfork via USER_NOTIF for namespace flag
+    # checks and process counting.  Clone namespace flags are also
+    # blocked by a BPF arg filter as defense in depth.
+    #
+    # The raw fork syscall (NR 57) is NOT intercepted.  It takes no
+    # flags and cannot create namespaces.  The COW fork template uses
+    # raw fork(2) via ctypes to bypass the seccomp notif round-trip.
+    # User code uses os.fork() which calls clone (intercepted).
+    names.extend(["clone", "clone3", "vfork"])
     if notif is not None and notif.allowed_ips:
         names.extend(["connect", "sendto"])
     if notif is not None and notif.port_remap:
