@@ -437,6 +437,9 @@ def _raw_fork() -> int:
     return pid
 
 
+TRIGGER_FORK_BATCH = b"\x04"
+
+
 def clone_ready_loop(control_fd: int, work_fn: "Callable") -> None:
     """Main-thread loop: wait for fork commands, fork and run work_fn.
 
@@ -444,6 +447,9 @@ def clone_ready_loop(control_fd: int, work_fn: "Callable") -> None:
     on ``os.read()`` (GIL released), so no CPU is wasted.  When the
     parent sends TRIGGER_FORK, the main thread calls raw ``fork(2)``
     (not ``os.fork()``), bypassing the seccomp USER_NOTIF round-trip.
+
+    Also supports TRIGGER_FORK_BATCH: fork N clones in a tight loop
+    with a single round-trip, returning all PIDs at once.
 
     Args:
         control_fd: Child's end of the control socket.
@@ -495,6 +501,48 @@ def clone_ready_loop(control_fd: int, work_fn: "Callable") -> None:
                 # === Template: send clone PID back ===
                 os.write(control_fd, struct.pack(">I", pid))
 
+        elif trigger == TRIGGER_FORK_BATCH:
+            # Batch fork: receive all envs, fork in tight loop,
+            # send all PIDs back in one write.
+            try:
+                batch_json = _recv_bytes(control_fd)
+            except (EOFError, OSError):
+                break
+
+            env_list = json.loads(batch_json) if batch_json else []
+            n = len(env_list)
+
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+            pids = []
+            for env in env_list:
+                try:
+                    pid = _raw_fork()
+                except OSError:
+                    pids.append(0)
+                    continue
+
+                if pid == 0:
+                    try:
+                        os.close(control_fd)
+                        os.setpgid(0, 0)
+                        os.environ.update(env)
+                        work_fn()
+                    except SystemExit as e:
+                        os._exit(e.code if isinstance(e.code, int) else 1)
+                    except BaseException:
+                        os._exit(1)
+                    os._exit(0)
+                else:
+                    pids.append(pid)
+
+            # Send all PIDs in one write
+            os.write(control_fd, struct.pack(f">{n}I", *pids))
+
 
 def request_fork(
     control_fd: int,
@@ -523,6 +571,26 @@ def request_fork(
     if pid == 0:
         raise RuntimeError("Fork: fork() failed in child")
     return pid
+
+
+def request_fork_batch(
+    control_fd: int,
+    envs: list[dict[str, str]],
+) -> list[int]:
+    """Send a batch fork command. Returns list of clone PIDs."""
+    batch_json = json.dumps(envs).encode()
+    os.write(control_fd, TRIGGER_FORK_BATCH)
+    _send_bytes(control_fd, batch_json)
+
+    n = len(envs)
+    raw = b""
+    while len(raw) < n * 4:
+        chunk = os.read(control_fd, n * 4 - len(raw))
+        if not chunk:
+            raise RuntimeError("Fork batch: connection closed")
+        raw += chunk
+    pids = list(struct.unpack(f">{n}I", raw))
+    return pids
 
 
 # --- Parent side ---

@@ -25,7 +25,7 @@ class TestForkRequiresInitWork(unittest.TestCase):
     def test_fork_without_init_work_raises(self):
         sb = Sandbox(Policy())
         with self.assertRaises(SandboxError):
-            sb.fork()
+            sb.fork(1)
 
     def test_constructor_stores_init_work(self):
         init = lambda: None
@@ -134,7 +134,7 @@ class TestMaxProcessesInClone(unittest.TestCase):
         )
 
         with Sandbox(policy, init, work) as sb:
-            sb.fork().wait(timeout=10)
+            sb.fork(1)[0].wait(timeout=10)
 
         self.assertTrue(os.path.exists(marker))
         count = int(open(marker).read())
@@ -146,6 +146,42 @@ class TestMaxProcessesInClone(unittest.TestCase):
         # how the supervisor counts, but it must be less than 20.
         self.assertLess(count, 20, "max_processes not enforced in clone")
         self.assertGreater(count, 0, "clone couldn't fork at all")
+
+
+class TestForkEnvAndCloneId(unittest.TestCase):
+    """Verify that fork() sets CLONE_ID and passes extra env."""
+
+    def test_clone_id_and_env(self):
+        import sys
+        import tempfile
+
+        marker = tempfile.mktemp(prefix="sandlock_test_env_")
+
+        def init():
+            pass
+
+        def work():
+            clone_id = os.environ.get("CLONE_ID", "missing")
+            mode = os.environ.get("MODE", "missing")
+            with open(f"{marker}_{clone_id}", "w") as f:
+                f.write(f"{clone_id}:{mode}")
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=[sys.prefix, "/usr", "/lib", "/etc", "/proc", "/dev"],
+        )
+
+        with Sandbox(policy, init, work) as sb:
+            clones = sb.fork(3, env={"MODE": "test"})
+            for c in clones:
+                c.wait(timeout=10)
+
+        for i in range(3):
+            path = f"{marker}_{i}"
+            self.assertTrue(os.path.exists(path), f"Clone {i} didn't write output")
+            content = open(path).read()
+            self.assertEqual(content, f"{i}:test")
+            os.unlink(path)
 
 
 if __name__ == "__main__":

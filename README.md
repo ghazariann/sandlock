@@ -140,22 +140,6 @@ with Sandbox(parent_policy) as parent:
     result = parent.sandbox(child_policy).run(["python3", "untrusted.py"])
 ```
 
-COW fork — init once, fork many (for AI agents, RL rollouts):
-
-```python
-def init():
-    global model
-    model = load_model()       # expensive, done once
-
-def work():
-    seed = int(os.environ["SEED"])
-    rollout(model, seed)       # reads COW-shared model
-
-with Sandbox(policy, init, work) as sb:
-    for seed in range(1000):
-        sb.fork(env={"SEED": str(seed)}).wait()
-```
-
 ## Architecture
 
 Sandlock applies confinement in sequence after `fork()`:
@@ -336,8 +320,9 @@ Sandbox.from_checkpoint(cp, restore_fn=lambda state: load_state(state))
 ### COW Fork
 
 Initialize expensive state once, then fork COW clones that share memory.
-Each `fork()` is an `os.fork()` — the kernel shares all pages copy-on-write.
-1000 clones of a 50 MB Python process use ~50 MB total, not 50 GB.
+Each fork is a raw `fork(2)` syscall that bypasses seccomp notification
+for minimal overhead. 1000 clones of a 50 MB Python process use ~50 MB
+total, not 50 GB. ~680 us per fork, over 1,300 forks/sec.
 
 ```python
 def init():
@@ -346,21 +331,23 @@ def init():
     data = preprocess_dataset()   # stored in globals
 
 def work():
-    seed = int(os.environ["SEED"])
-    result = rollout(model, data, seed)   # reads COW-shared globals
+    clone_id = int(os.environ["CLONE_ID"])  # 0..N-1, set automatically
+    result = rollout(model, data, clone_id)  # reads COW-shared globals
     save_result(result)
 
 with Sandbox(policy, init, work) as sb:
-    for seed in range(1000):
-        sb.fork(env={"SEED": str(seed)}).wait()
+    clones = sb.fork(1000)                   # batch: 1000 clones in ~530 ms
+    for c in clones:
+        c.wait()
 ```
 
 How it works:
 1. `Sandbox(policy, init, work)` forks a child, runs `init()`, then the
    child's main thread enters a fork-ready loop on the control socket
-2. `sb.fork(env=...)` sends a command — the main thread calls `os.fork()`,
-   the clone applies env overrides and runs `work()`
-3. No signals, no ptrace — the main thread is in a blocking `os.read()`
+2. `sb.fork(N)` sends a single batch command. The main thread forks N
+   times in a tight loop using raw `fork(2)`, bypassing seccomp
+   notification. Each clone gets `CLONE_ID=0..N-1` and runs `work()`
+3. No signals, no ptrace. The main thread is in a blocking `os.read()`
    (GIL released), so it forks itself cleanly
 4. Each clone inherits Landlock + seccomp confinement via `fork()`
 

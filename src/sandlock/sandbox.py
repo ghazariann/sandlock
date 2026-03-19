@@ -421,19 +421,30 @@ class Sandbox:
             raise
         self._ctx = ctx
 
-    def fork(self, *, env: dict[str, str] | None = None) -> "Sandbox":
-        """Create a COW clone of this sandbox.
+    def fork(
+        self,
+        n: int,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> "list[Sandbox]":
+        """Create N COW clones of this sandbox.
 
-        Each clone is an ``os.fork()`` of the template — full COW of
-        the entire address space.  The clone runs ``work_fn()`` with
-        environment overrides applied.
+        Each clone is an ``os.fork()`` of the template with full
+        copy-on-write memory sharing.  Each clone receives a
+        ``CLONE_ID`` environment variable (0 through N-1).
 
         Args:
-            env: Environment variable overrides for the clone.
+            n: Number of clones to create.
+            env: Extra environment variables applied to all clones.
 
         Returns:
-            A Sandbox handle.  The clone is already running.
-            Call ``.wait()`` for its exit code.
+            List of Sandbox handles.
+
+        Example::
+
+            with Sandbox(policy, init, work) as sb:
+                for c in sb.fork(1000):
+                    c.wait()
         """
         if self._ctx is None or not self._ctx.alive:
             raise SandboxError(
@@ -445,14 +456,19 @@ class Sandbox:
         if control_fd < 0:
             raise SandboxError("No control socket")
 
-        from ._checkpoint import request_fork
-        clone_pid = request_fork(control_fd, env)
+        base = env or {}
+        envs = [{**base, "CLONE_ID": str(i)} for i in range(n)]
 
-        clone_sb = Sandbox(self._policy, sandbox_id=None)
-        clone_sb._clone_pid = clone_pid
-        clone_sb._entered = True
+        from ._checkpoint import request_fork_batch
+        pids = request_fork_batch(control_fd, envs)
 
-        return clone_sb
+        clones = []
+        for pid in pids:
+            sb = Sandbox(self._policy, sandbox_id=None)
+            sb._clone_pid = pid
+            sb._entered = True
+            clones.append(sb)
+        return clones
 
     @classmethod
     def from_checkpoint(
