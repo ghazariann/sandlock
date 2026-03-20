@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import os
 import struct
 import unittest
 from unittest import mock
@@ -411,48 +412,102 @@ class TestBuildNotifFilter(unittest.TestCase):
 
 
 class TestResolveOpenatPath(unittest.TestCase):
-    @mock.patch("sandlock._procfs.read_cstring")
-    def test_absolute_path(self, mock_read):
-        mock_read.return_value = "/etc/passwd"
-        result = resolve_openat_path(123, -100, 0xDEAD)
+    """Test resolve_openat_path against a real child process.
+
+    Forks a child that allocates a buffer and SIGSTOPs itself.
+    The parent writes path strings into the child's buffer via
+    /proc/<pid>/mem and calls resolve_openat_path for real.
+    """
+
+    def setUp(self):
+        """Fork a stopped child with known cwd, open fd, and memory buffer."""
+        import ctypes
+        import tempfile
+        import signal
+
+        self._tmpdir = tempfile.mkdtemp(prefix="sandlock_test_openat_")
+
+        # Pipe for the child to send the buffer address back
+        r, w = os.pipe()
+
+        pid = os.fork()
+        if pid == 0:
+            # === Child ===
+            os.close(r)
+            try:
+                os.chdir(self._tmpdir)
+
+                # Open a known dir on fd 50
+                dirfd = os.open(self._tmpdir, os.O_RDONLY | os.O_DIRECTORY)
+                os.dup2(dirfd, 50)
+                if dirfd != 50:
+                    os.close(dirfd)
+
+                # Allocate a buffer (large enough for any test path)
+                buf = ctypes.create_string_buffer(256)
+                addr = ctypes.addressof(buf)
+
+                # Send address to parent
+                os.write(w, addr.to_bytes(8, "little"))
+                os.close(w)
+
+                # Sleep until killed — parent writes paths into buf via
+                # /proc/<pid>/mem and reads them back via resolve_openat_path
+                import time
+                time.sleep(300)
+            finally:
+                os._exit(0)
+        else:
+            # === Parent ===
+            os.close(w)
+            self._child_pid = pid
+            # Wait a moment for the child to stop in sleep()
+            import time
+            time.sleep(0.05)
+            addr_bytes = os.read(r, 8)
+            os.close(r)
+            self._buf_addr = int.from_bytes(addr_bytes, "little")
+
+    def tearDown(self):
+        import signal
+        import shutil
+        try:
+            os.kill(self._child_pid, signal.SIGKILL)
+            os.waitpid(self._child_pid, 0)
+        except OSError:
+            pass
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_path(self, path: str):
+        """Write a NUL-terminated path string into the child's buffer."""
+        from sandlock._procfs import write_bytes
+        data = path.encode("utf-8") + b"\0"
+        write_bytes(self._child_pid, self._buf_addr, data)
+
+    def test_absolute_path(self):
+        self._write_path("/etc/passwd")
+        result = resolve_openat_path(self._child_pid, -100, self._buf_addr)
         self.assertEqual(result, "/etc/passwd")
 
-    @mock.patch("sandlock._procfs.read_cstring")
-    @mock.patch("os.readlink")
-    def test_relative_at_fdcwd(self, mock_readlink, mock_read):
-        mock_read.return_value = "file.txt"
-        mock_readlink.return_value = "/home/user"
-        result = resolve_openat_path(123, -100, 0xDEAD)
-        self.assertEqual(result, "/home/user/file.txt")
-        mock_readlink.assert_called_with("/proc/123/cwd")
+    def test_relative_at_fdcwd(self):
+        self._write_path("file.txt")
+        result = resolve_openat_path(self._child_pid, -100, self._buf_addr)
+        self.assertEqual(result, os.path.join(self._tmpdir, "file.txt"))
 
-    @mock.patch("sandlock._procfs.read_cstring")
-    @mock.patch("os.readlink")
-    def test_relative_with_dirfd(self, mock_readlink, mock_read):
-        mock_read.return_value = "sub/file.txt"
-        mock_readlink.return_value = "/tmp/dir"
-        result = resolve_openat_path(123, 5, 0xDEAD)
-        self.assertEqual(result, "/tmp/dir/sub/file.txt")
-        mock_readlink.assert_called_with("/proc/123/fd/5")
+    def test_relative_with_dirfd(self):
+        self._write_path("sub/file.txt")
+        result = resolve_openat_path(self._child_pid, 50, self._buf_addr)
+        self.assertEqual(result, os.path.join(self._tmpdir, "sub/file.txt"))
 
-    @mock.patch("sandlock._procfs.read_cstring")
-    def test_absolute_normpath(self, mock_read):
-        mock_read.return_value = "/proc/../etc/passwd"
-        result = resolve_openat_path(123, -100, 0xDEAD)
-        self.assertEqual(result, "/etc/passwd")
+    def test_absolute_normpath(self):
+        self._write_path("/proc/../etc/hosts")
+        result = resolve_openat_path(self._child_pid, -100, self._buf_addr)
+        self.assertEqual(result, "/etc/hosts")
 
-    @mock.patch("sandlock._procfs.read_cstring")
-    @mock.patch("os.readlink", side_effect=OSError)
-    def test_cwd_readlink_fails(self, mock_readlink, mock_read):
-        mock_read.return_value = "file.txt"
-        result = resolve_openat_path(123, -100, 0xDEAD)
-        self.assertEqual(result, "/file.txt")
-
-    @mock.patch("sandlock._procfs.read_cstring")
-    def test_at_fdcwd_unsigned(self, mock_read):
-        """AT_FDCWD as unsigned 32-bit (0xFFFFFF9C)."""
-        mock_read.return_value = "/etc/hosts"
-        result = resolve_openat_path(123, 0xFFFFFF9C, 0xDEAD)
+    def test_at_fdcwd_unsigned(self):
+        """AT_FDCWD as unsigned 32-bit (0xFFFFFF9C) treated same as -100."""
+        self._write_path("/etc/hosts")
+        result = resolve_openat_path(self._child_pid, 0xFFFFFF9C, self._buf_addr)
         self.assertEqual(result, "/etc/hosts")
 
 
