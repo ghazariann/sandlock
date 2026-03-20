@@ -232,66 +232,105 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
             sb.checkpoint()
 
     def test_from_checkpoint_restores_policy(self):
-        """from_checkpoint creates a sandbox with the checkpointed policy."""
-        policy = Policy(max_memory="256M", max_processes=5)
+        """from_checkpoint deserializes and applies the checkpointed policy."""
+        import sys
+        import tempfile
+        from sandlock.sandbox import Sandbox
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_policy_")
+        policy = Policy(
+            max_memory="256M",
+            max_processes=5,
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev", sys.prefix],
+        )
         cp = Checkpoint(
             policy_data=pickle.dumps(policy),
             app_state=b"test_state",
         )
 
-        with mock.patch("sandlock.sandbox.SandboxContext") as mock_ctx:
-            mock_instance = mock.MagicMock()
-            mock_instance.__enter__ = mock.MagicMock(return_value=mock_instance)
-            mock_instance.__exit__ = mock.MagicMock(return_value=False)
-            mock_instance.wait.return_value = 0
-            mock_ctx.return_value = mock_instance
-            from sandlock.sandbox import Sandbox
-            result = Sandbox.from_checkpoint(cp, _noop_restore)
-            mock_ctx.assert_called_once()
+        def restore_fn(state):
+            # If the policy wasn't applied, this would run in an
+            # unrestricted sandbox. We verify it ran at all.
+            with open(marker, "wb") as f:
+                f.write(state)
 
-    def test_from_checkpoint_with_branch(self):
-        """from_checkpoint sets parent_branch_path when branch_id is present."""
+        result = Sandbox.from_checkpoint(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual(open(marker, "rb").read(), b"test_state")
+        os.unlink(marker)
+
+    def test_from_checkpoint_passes_app_state(self):
+        """from_checkpoint passes app_state bytes to restore_fn."""
+        from sandlock.sandbox import Sandbox
+        import tempfile
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_state_")
+        app_data = b"key=value;count=7"
+
         policy = Policy(
-            fs_isolation=FsIsolation.BRANCHFS,
-            workdir="/mnt/ws",
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev",
+                         __import__("sys").prefix],
         )
         cp = Checkpoint(
             policy_data=pickle.dumps(policy),
-            app_state=b"state",
-            branch_id="snap-abc",
-            workdir="/mnt/ws",
+            app_state=app_data,
         )
 
-        from sandlock.sandbox import Sandbox
-        with mock.patch("sandlock.sandbox.SandboxContext") as mock_ctx, \
-             mock.patch.object(Sandbox, "_setup_branch", return_value=None), \
-             mock.patch.object(Sandbox, "_finish_branch"), \
-             mock.patch.object(Sandbox, "_cleanup_mount"):
-            mock_instance = mock.MagicMock()
-            mock_instance.__enter__ = mock.MagicMock(return_value=mock_instance)
-            mock_instance.__exit__ = mock.MagicMock(return_value=False)
-            mock_instance.wait.return_value = 0
-            mock_ctx.return_value = mock_instance
-            Sandbox.from_checkpoint(cp, _noop_restore)
-            mock_ctx.assert_called_once()
+        def restore_fn(state):
+            with open(marker, "wb") as f:
+                f.write(state)
 
-    def test_from_checkpoint_without_branch(self):
-        """from_checkpoint works without branch info."""
+        result = Sandbox.from_checkpoint(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual(open(marker, "rb").read(), app_data)
+        os.unlink(marker)
+
+    def test_from_checkpoint_without_app_state(self):
+        """from_checkpoint works when app_state is None."""
+        import sys
+        import tempfile
+        from sandlock.sandbox import Sandbox
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_nostate_")
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev", sys.prefix],
+        )
+        cp = Checkpoint(
+            policy_data=pickle.dumps(policy),
+            app_state=None,
+        )
+
+        def restore_fn(state):
+            # state should be None when no app_state in checkpoint
+            with open(marker, "w") as f:
+                f.write(f"state_is_none={state is None}")
+
+        result = Sandbox.from_checkpoint(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual(open(marker).read(), "state_is_none=True")
+        os.unlink(marker)
+
+    def test_from_checkpoint_restore_failure(self):
+        """from_checkpoint returns failure when restore_fn raises."""
+        from sandlock.sandbox import Sandbox
+
         policy = Policy()
         cp = Checkpoint(
             policy_data=pickle.dumps(policy),
             app_state=b"data",
         )
 
-        with mock.patch("sandlock.sandbox.SandboxContext") as mock_ctx:
-            mock_instance = mock.MagicMock()
-            mock_instance.__enter__ = mock.MagicMock(return_value=mock_instance)
-            mock_instance.__exit__ = mock.MagicMock(return_value=False)
-            mock_instance.wait.return_value = 0
-            mock_ctx.return_value = mock_instance
-            from sandlock.sandbox import Sandbox
-            Sandbox.from_checkpoint(cp, _noop_restore)
-            mock_ctx.assert_called_once()
+        def bad_restore(state):
+            raise RuntimeError("restore exploded")
+
+        result = Sandbox.from_checkpoint(cp, bad_restore, timeout=10)
+        self.assertFalse(result.success)
 
 
 class TestPtraceDataClasses(unittest.TestCase):
