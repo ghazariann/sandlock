@@ -114,11 +114,11 @@ class TestBuildArgFilters:
         assert "prctl" in _SYSCALL_NR
 
     def test_dangerous_prctl_ops_defined(self):
-        assert len(_DANGEROUS_PRCTL_OPS) == 4
+        assert len(_DANGEROUS_PRCTL_OPS) == 3
         assert 4 in _DANGEROUS_PRCTL_OPS           # PR_SET_DUMPABLE
-        assert 22 in _DANGEROUS_PRCTL_OPS          # PR_SET_SECCOMP
         assert 28 in _DANGEROUS_PRCTL_OPS          # PR_SET_SECUREBITS
         assert 0x59616d61 in _DANGEROUS_PRCTL_OPS  # PR_SET_PTRACER
+        assert 22 not in _DANGEROUS_PRCTL_OPS      # PR_SET_SECCOMP — safe under NO_NEW_PRIVS
 
 
 class TestBuildFilter:

@@ -90,12 +90,13 @@ _DANGEROUS_IOCTLS = (TIOCSTI, TIOCLINUX)
 # Dangerous prctl(2) options — these allow a sandboxed process to
 # weaken its own confinement.
 PR_SET_DUMPABLE = 4          # re-enable /proc/pid/mem writes
-PR_SET_SECCOMP_OPT = 22      # change seccomp mode from within sandbox
 PR_SET_SECUREBITS = 28       # alter LSM security bits
 PR_SET_PTRACER = 0x59616d61  # allow arbitrary ptrace attach
+# Note: PR_SET_SECCOMP is intentionally NOT blocked — seccomp filters
+# can only tighten (never loosen) when NO_NEW_PRIVS is set, and the
+# sandbox itself needs to stack filters via prctl(PR_SET_SECCOMP).
 _DANGEROUS_PRCTL_OPS = (
     PR_SET_DUMPABLE,
-    PR_SET_SECCOMP_OPT,
     PR_SET_SECUREBITS,
     PR_SET_PTRACER,
 )
