@@ -79,9 +79,13 @@ _CLONE_NS_FLAGS = (
     | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWCGROUP
 )
 
-# Dangerous ioctl commands — TIOCSTI allows injecting input into
-# another terminal session (terminal escape attack).
+# Dangerous ioctl commands:
+# - TIOCSTI: inject input into another terminal session (terminal escape)
+# - TIOCLINUX: access kernel console (keystroke injection on VTs,
+#   selection buffer read, keyboard reprogramming)
 TIOCSTI = 0x5412
+TIOCLINUX = 0x541C
+_DANGEROUS_IOCTLS = (TIOCSTI, TIOCLINUX)
 
 # Dangerous prctl(2) options — these allow a sandboxed process to
 # weaken its own confinement.
@@ -304,7 +308,7 @@ def _build_arg_filters() -> bytes:
     - clone(2): Block namespace flags (CLONE_NEW*) with ERRNO.
       Plain forks fall through to the main filter (USER_NOTIF if
       clone is in the notif list, or ALLOW if not).
-    - ioctl(2): Block TIOCSTI (terminal input injection).
+    - ioctl(2): Block TIOCSTI and TIOCLINUX (terminal attacks).
     - prctl(2): Block dangerous options (PR_SET_DUMPABLE,
       PR_SET_SECCOMP, PR_SET_SECUREBITS, PR_SET_PTRACER).
     """
@@ -323,16 +327,17 @@ def _build_arg_filters() -> bytes:
         insns += _bpf_jump(BPF_JMP | BPF_JSET | BPF_K, _CLONE_NS_FLAGS, 0, 1)
         insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
 
-    # --- ioctl: block TIOCSTI (terminal input injection) ---
-    # Load syscall number
+    # --- ioctl: block dangerous commands (TIOCSTI, TIOCLINUX) ---
     insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
-    # if nr != ioctl, skip ahead
-    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _SYSCALL_NR["ioctl"], 0, 3)
+    n_ioctls = len(_DANGEROUS_IOCTLS)
+    # if nr != ioctl, skip: 1 (load arg1) + n_ioctls*2 (check+deny each)
+    skip_count = 1 + n_ioctls * 2
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _SYSCALL_NR["ioctl"], 0, skip_count)
     # Load ioctl request (arg1, low 32 bits)
     insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS1_LO)
-    # if request == TIOCSTI → deny
-    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 0, 1)
-    insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
+    for cmd in _DANGEROUS_IOCTLS:
+        insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, cmd, 0, 1)
+        insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
 
     # --- prctl: block dangerous options that weaken the sandbox ---
     insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)

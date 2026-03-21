@@ -306,6 +306,24 @@ print("BLOCKED" if err == errno.EPERM else f"UNEXPECTED {err}")
         assert result.success
         assert b"BLOCKED" in result.stdout
 
+    def test_ioctl_tioclinux_blocked(self):
+        """TIOCLINUX ioctl is blocked by arg-level seccomp filter."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import ctypes, ctypes.util, errno, fcntl
+TIOCLINUX = 0x541C
+buf = ctypes.create_string_buffer(1)
+try:
+    fcntl.ioctl(0, TIOCLINUX, buf)
+    print("ALLOWED")
+except OSError as e:
+    print("BLOCKED" if e.errno == errno.EPERM else f"UNEXPECTED {e.errno}")
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
     def test_allowlist_blocks_unknown_syscall(self):
         """In allowlist mode, unlisted syscalls should fail."""
         from sandlock import DEFAULT_ALLOW_SYSCALLS

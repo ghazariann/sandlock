@@ -8,10 +8,12 @@ import pytest
 from sandlock._seccomp import (
     AUDIT_ARCH,
     DEFAULT_DENY_SYSCALLS,
+    TIOCLINUX,
     TIOCSTI,
     _ARCH_AARCH64,
     _ARCH_X86_64,
     _CLONE_NS_FLAGS,
+    _DANGEROUS_IOCTLS,
     _DANGEROUS_PRCTL_OPS,
     _MACHINE_TO_ARCH,
     _SYSCALL_NR,
@@ -100,6 +102,13 @@ class TestBuildArgFilters:
 
     def test_tiocsti_defined(self):
         assert TIOCSTI == 0x5412
+
+    def test_tioclinux_defined(self):
+        assert TIOCLINUX == 0x541C
+
+    def test_dangerous_ioctls_defined(self):
+        assert TIOCSTI in _DANGEROUS_IOCTLS
+        assert TIOCLINUX in _DANGEROUS_IOCTLS
 
     def test_prctl_in_syscall_map(self):
         assert "prctl" in _SYSCALL_NR
