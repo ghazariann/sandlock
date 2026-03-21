@@ -83,6 +83,19 @@ _CLONE_NS_FLAGS = (
 # another terminal session (terminal escape attack).
 TIOCSTI = 0x5412
 
+# Dangerous prctl(2) options — these allow a sandboxed process to
+# weaken its own confinement.
+PR_SET_DUMPABLE = 4          # re-enable /proc/pid/mem writes
+PR_SET_SECCOMP_OPT = 22      # change seccomp mode from within sandbox
+PR_SET_SECUREBITS = 28       # alter LSM security bits
+PR_SET_PTRACER = 0x59616d61  # allow arbitrary ptrace attach
+_DANGEROUS_PRCTL_OPS = (
+    PR_SET_DUMPABLE,
+    PR_SET_SECCOMP_OPT,
+    PR_SET_SECUREBITS,
+    PR_SET_PTRACER,
+)
+
 
 # --- Per-architecture configuration ---
 
@@ -289,6 +302,8 @@ def _build_arg_filters() -> bytes:
       Plain forks fall through to the main filter (USER_NOTIF if
       clone is in the notif list, or ALLOW if not).
     - ioctl(2): Block TIOCSTI (terminal input injection).
+    - prctl(2): Block dangerous options (PR_SET_DUMPABLE,
+      PR_SET_SECCOMP, PR_SET_SECUREBITS, PR_SET_PTRACER).
     """
     insns = bytearray()
 
@@ -315,6 +330,18 @@ def _build_arg_filters() -> bytes:
     # if request == TIOCSTI → deny
     insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 0, 1)
     insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
+
+    # --- prctl: block dangerous options that weaken the sandbox ---
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
+    n_ops = len(_DANGEROUS_PRCTL_OPS)
+    # if nr != prctl, skip: 1 (load arg0) + n_ops*2 (check+deny each)
+    skip_count = 1 + n_ops * 2
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _SYSCALL_NR["prctl"], 0, skip_count)
+    # Load prctl option (arg0)
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO)
+    for op in _DANGEROUS_PRCTL_OPS:
+        insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, op, 0, 1)
+        insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
 
     # --- socket: block NETLINK_SOCK_DIAG (hides host socket info) ---
     _AF_NETLINK = 16

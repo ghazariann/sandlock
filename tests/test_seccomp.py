@@ -12,6 +12,7 @@ from sandlock._seccomp import (
     _ARCH_AARCH64,
     _ARCH_X86_64,
     _CLONE_NS_FLAGS,
+    _DANGEROUS_PRCTL_OPS,
     _MACHINE_TO_ARCH,
     _SYSCALL_NR,
     _arch,
@@ -99,6 +100,16 @@ class TestBuildArgFilters:
 
     def test_tiocsti_defined(self):
         assert TIOCSTI == 0x5412
+
+    def test_prctl_in_syscall_map(self):
+        assert "prctl" in _SYSCALL_NR
+
+    def test_dangerous_prctl_ops_defined(self):
+        assert len(_DANGEROUS_PRCTL_OPS) == 4
+        assert 4 in _DANGEROUS_PRCTL_OPS           # PR_SET_DUMPABLE
+        assert 22 in _DANGEROUS_PRCTL_OPS          # PR_SET_SECCOMP
+        assert 28 in _DANGEROUS_PRCTL_OPS          # PR_SET_SECUREBITS
+        assert 0x59616d61 in _DANGEROUS_PRCTL_OPS  # PR_SET_PTRACER
 
 
 class TestBuildFilter:
