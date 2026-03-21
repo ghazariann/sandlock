@@ -144,3 +144,6 @@ class TestDefaultDenySyscalls:
         assert "reboot" in DEFAULT_DENY_SYSCALLS
         assert "ptrace" in DEFAULT_DENY_SYSCALLS
         assert "kexec_load" in DEFAULT_DENY_SYSCALLS
+        assert "io_uring_setup" in DEFAULT_DENY_SYSCALLS
+        assert "io_uring_enter" in DEFAULT_DENY_SYSCALLS
+        assert "io_uring_register" in DEFAULT_DENY_SYSCALLS

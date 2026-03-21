@@ -192,6 +192,9 @@ DEFAULT_DENY_SYSCALLS = [
     "acct",
     "lookup_dcookie",
     "nfsservctl",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
 ]
 
 
