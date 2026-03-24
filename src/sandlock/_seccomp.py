@@ -290,7 +290,7 @@ DEFAULT_ALLOW_SYSCALLS = [
     # --- Resource info ---
     "getrlimit", "setrlimit", "prlimit64",
     "getrusage", "times", "sysinfo", "uname",
-    # --- ioctl (arg-filtered for TIOCSTI) ---
+    # --- ioctl (arg-filtered for TIOCSTI, TIOCLINUX) ---
     "ioctl",
     # --- Misc ---
     "getrandom",
@@ -311,7 +311,7 @@ def _build_arg_filters() -> bytes:
       clone is in the notif list, or ALLOW if not).
     - ioctl(2): Block TIOCSTI and TIOCLINUX (terminal attacks).
     - prctl(2): Block dangerous options (PR_SET_DUMPABLE,
-      PR_SET_SECCOMP, PR_SET_SECUREBITS, PR_SET_PTRACER).
+      PR_SET_SECUREBITS, PR_SET_PTRACER).
     """
     insns = bytearray()
 
@@ -377,7 +377,7 @@ def _build_deny_filter(deny_nrs: list[int]) -> bytes:
 
     Filter logic:
         1. Check arch (kill process if wrong)
-        2. Arg-level filters (clone NS flags, ioctl TIOCSTI)
+        2. Arg-level filters (clone NS flags, ioctl, prctl, socket)
         3. For each denied syscall: if nr == denied → ERRNO(EPERM)
         4. Default: ALLOW
     """
@@ -403,7 +403,7 @@ def _build_allow_filter(allow_nrs: list[int]) -> bytes:
 
     Filter logic:
         1. Check arch (kill process if wrong)
-        2. Arg-level filters (clone NS flags, ioctl TIOCSTI)
+        2. Arg-level filters (clone NS flags, ioctl, prctl, socket)
         3. For each allowed syscall: if nr == allowed → ALLOW
         4. Default: ERRNO(EPERM)
     """
