@@ -476,9 +476,9 @@ class SandboxContext:
                 pass
             self._control_fd = -1
 
-    # Sensitive /proc and /sys paths blocked via Landlock fs_denied when
-    # /proc is readable.  Only includes paths that Landlock can actually
-    # enforce on procfs (some procfs entries ignore Landlock).
+    # Paths that Landlock can enforce on procfs/sysfs.  Added to
+    # fs_denied as defense-in-depth alongside the seccomp notification
+    # rules that block the rest (kallsyms, modules, keys, mounts, etc.).
     _PROC_DENY_PATHS = [
         "/proc/kcore", "/proc/config.gz",
         "/proc/sched_debug", "/proc/timer_list",
@@ -492,30 +492,28 @@ class SandboxContext:
             p == "/proc" or p.rstrip("/") == "/proc"
             for p in self._policy.fs_readable
         )
-        # Auto-enable /proc hardening when /proc is readable:
-        # - PID isolation (hide foreign PIDs via getdents64 + openat)
-        # - Sensitive file blocking (/proc/kallsyms, /proc/modules, etc.)
-        # - Mount info virtualization (/proc/mounts → empty)
-        # The openat handler uses a fast prefix check to skip non-/proc
-        # paths with minimal overhead (single pread on cached fd).
+        # /proc hardening when /proc is readable:
+        # - Always: sensitive file blocking + mount info virtualization
+        #   via default_proc_rules() (enforced in seccomp notification)
+        # - When isolate_pids=True: hide foreign PIDs via getdents64 +
+        #   openat interception (fast prefix check skips non-/proc paths)
         if self._has_proc:
             from ._notif_policy import NotifPolicy, default_proc_rules
             import dataclasses
+            proc_rules = default_proc_rules()
+            isolate = self._policy.isolate_pids
             if self._notif_policy is None:
                 self._notif_policy = NotifPolicy(
-                    rules=default_proc_rules(),
-                    isolate_pids=True,
+                    rules=proc_rules,
+                    isolate_pids=isolate,
                 )
             else:
-                updates = {}
-                if not self._notif_policy.isolate_pids:
-                    updates["isolate_pids"] = True
-                if not self._notif_policy.rules:
-                    updates["rules"] = default_proc_rules()
-                if updates:
-                    self._notif_policy = dataclasses.replace(
-                        self._notif_policy, **updates,
-                    )
+                merged_rules = self._notif_policy.rules + proc_rules
+                self._notif_policy = dataclasses.replace(
+                    self._notif_policy,
+                    rules=merged_rules,
+                    isolate_pids=isolate or self._notif_policy.isolate_pids,
+                )
         use_notif = self._notif_policy is not None
 
         # Pre-import modules used in the child BEFORE fork — the child's

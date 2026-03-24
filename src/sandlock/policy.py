@@ -135,8 +135,8 @@ class Policy:
     isolate_pids: bool = False
     """Hide foreign process entries in /proc.  When enabled, directory
     listings of /proc only show the sandbox's own PIDs, and direct
-    access to /proc/<foreign_pid>/... is denied.  Requires seccomp
-    user notification (adds per-openat overhead)."""
+    access to /proc/<foreign_pid>/... is denied.  Uses seccomp user
+    notification with a fast prefix check for minimal overhead."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
