@@ -65,8 +65,6 @@ class PortMap:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _virtual_to_real: dict[int, int] = field(default_factory=dict, repr=False)
     _real_to_virtual: dict[int, int] = field(default_factory=dict, repr=False)
-    # Sockets held open to keep real ports reserved
-    _held_sockets: list[socket.socket] = field(default_factory=list, repr=False)
     # Proxy state
     _proxy_threads: list[threading.Thread] = field(default_factory=list, repr=False)
     _proxy_sockets: list[socket.socket] = field(default_factory=list, repr=False)
@@ -114,7 +112,7 @@ class PortMap:
             return self._real_to_virtual.get(real)
 
     def close(self) -> None:
-        """Release all held sockets, stop proxies."""
+        """Stop proxies and release all state."""
         self._proxy_stop.set()
         for s in self._proxy_sockets:
             try:
@@ -124,12 +122,6 @@ class PortMap:
         for t in self._proxy_threads:
             t.join(timeout=2.0)
         with self._lock:
-            for s in self._held_sockets:
-                try:
-                    s.close()
-                except OSError:
-                    pass
-            self._held_sockets.clear()
             self._virtual_to_real.clear()
             self._real_to_virtual.clear()
             self._proxy_sockets.clear()
