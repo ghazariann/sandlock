@@ -62,6 +62,10 @@ def policy_for_tool(
             if key in _POLICY_FIELDS:
                 kwargs[key] = value
 
+        # net_allow_hosts implies net_connect: [80, 443] unless explicit
+        if "net_allow_hosts" in capabilities and "net_connect" not in capabilities:
+            kwargs["net_connect"] = [80, 443]
+
     return Policy(**kwargs)
 
 

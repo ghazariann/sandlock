@@ -69,6 +69,25 @@ class TestCapabilities:
         assert 8080 in policy.net_connect
         assert policy.max_memory == "256M"
 
+    def test_net_allow_hosts_implies_net_connect(self):
+        policy = policy_for_tool(
+            workspace="/tmp/ws",
+            capabilities={"net_allow_hosts": ["example.com"]},
+        )
+        assert "example.com" in policy.net_allow_hosts
+        assert 80 in policy.net_connect
+        assert 443 in policy.net_connect
+
+    def test_net_allow_hosts_with_explicit_net_connect(self):
+        policy = policy_for_tool(
+            workspace="/tmp/ws",
+            capabilities={
+                "net_allow_hosts": ["example.com"],
+                "net_connect": [8443],
+            },
+        )
+        assert policy.net_connect == [8443]  # explicit wins
+
     def test_unknown_field_ignored(self):
         policy = policy_for_tool(
             workspace="/tmp/ws",

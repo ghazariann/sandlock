@@ -158,8 +158,7 @@ async def run_agent(user_prompt: str, workspace: str):
         "web_fetch", web_fetch,
         description="Fetch a URL and return the response body. Only httpbin.org is allowed.",
         capabilities={
-            "net_connect": [443],
-            "net_allow_hosts": ["httpbin.org"],  # DNS restricted to this host
+            "net_allow_hosts": ["httpbin.org"],  # implies net_connect: [80, 443]
         },
         input_schema={
             "type": "object",
