@@ -48,6 +48,26 @@ def _waitstatus_to_exitcode(status: int) -> int:
 _confined = False
 
 
+def _is_already_confined() -> bool:
+    """Detect if this process is already inside a sandbox.
+
+    Checks /proc/self/status for active seccomp filters (Seccomp: 2).
+    This catches both in-process nesting (_confined flag) and
+    cross-process nesting (e.g. ``sandlock run ... -- python agent.py``
+    where agent.py creates inner sandboxes).
+    """
+    if _confined:
+        return True
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("Seccomp:"):
+                    return line.strip().endswith("2")
+    except OSError:
+        pass
+    return False
+
+
 # --- pidfd helpers (Linux 5.3+, required by Sandlock) ---
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -551,7 +571,7 @@ class SandboxContext:
 
         # Create socket pair for passing the notify fd from child to parent.
         # Skip in nested sandboxes — notif filter can't be stacked.
-        if use_notif and not _confined:
+        if use_notif and not _is_already_confined():
             parent_sock, child_sock = socket.socketpair(
                 socket.AF_UNIX, socket.SOCK_STREAM,
             )
@@ -753,7 +773,7 @@ class SandboxContext:
                 _no_raw = self._policy.no_raw_sockets
                 _no_udp = self._policy.no_udp
 
-                if use_notif and child_sock is not None and not _confined:
+                if use_notif and child_sock is not None and not _is_already_confined():
                     # First-level sandbox: install combined notif + BPF filter
                     try:
                         from ._landlock import _set_no_new_privs
