@@ -34,6 +34,36 @@ fn args_for_host(args: &[&str]) -> Vec<String> {
     out
 }
 
+/// The workload runs where `learn` was invoked, not in the COW workdir "/".
+#[test]
+fn test_learn_runs_workload_in_the_invoking_directory() {
+    let dir = std::env::temp_dir().join(format!("sandlock-learn-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+    let expected = dir.canonicalize().expect("failed to canonicalize temp dir");
+
+    let output = sandlock_bin()
+        .current_dir(&expected)
+        .args(["learn", "--", "pwd"])
+        .output()
+        .expect("failed to run sandlock learn");
+
+    let _ = std::fs::remove_dir_all(&expected);
+
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reported = stdout.lines().next().unwrap_or("").trim();
+    assert_eq!(
+        reported,
+        expected.to_string_lossy(),
+        "workload ran in {reported}, expected {}; full stdout:\n{stdout}",
+        expected.display(),
+    );
+}
+
 // ── Filesystem reads ──────────────────────────────────────────────────────────
 
 /// Reads are recorded in the profile.

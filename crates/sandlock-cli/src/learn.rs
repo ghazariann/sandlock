@@ -572,6 +572,8 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         // or `> /dev/null` needs Landlock write on /dev to keep working.
         .fs_write("/dev")
         .workdir("/")
+        // Without an explicit cwd the child would start in the workdir, "/".
+        .cwd(std::env::current_dir()?)
         // Discard all COW changes after observation; learn is read-only from
         // the real filesystem's perspective.
         .on_exit(BranchAction::Abort)
