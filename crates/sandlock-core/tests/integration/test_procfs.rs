@@ -992,6 +992,39 @@ async fn test_root_and_cwd_magic_links_name_the_virtual_file() {
     assert_eq!(out, "root-hostname\n1\ncwd-hostname\npid-root-hosts\nstat-through-links");
 }
 
+/// /proc/self/fd/N is a magic link to what the task holds open, so a spelling
+/// through it names the entry beneath that descriptor, as root and cwd do.
+#[tokio::test]
+async fn test_stat_through_a_descriptor_link() {
+    let root = readlink_fixture();
+    let script = r#"
+import os, sys, errno
+root = sys.argv[1]
+dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+
+def errno_of(call, path):
+    try: call(path)
+    except OSError as e: return e.errno
+    return None
+
+for spelling in ['/proc/self/fd/%d' % dirfd,
+                 '/proc/self/task/%d/fd/%d' % (os.getpid(), dirfd)]:
+    for call in (os.stat, os.lstat):
+        assert call(spelling + '/file').st_ino == call(root + '/file').st_ino, (spelling, call)
+        assert errno_of(call, spelling + '/missing') == errno.ENOENT, (spelling, call)
+    assert os.stat(spelling + '/link').st_ino == os.stat(root + '/file').st_ino, spelling
+    assert os.path.islink(spelling + '/link'), spelling
+    assert os.readlink(spelling) == root, spelling
+print('OK')
+"#;
+    let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
+    let result = policy
+        .run(&["python3", "-c", script, root.path().to_str().unwrap()])
+        .await
+        .unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+}
+
 #[tokio::test]
 async fn test_proc_net_closed_view() {
     let mut policy = proc_grant().build().unwrap();

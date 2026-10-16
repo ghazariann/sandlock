@@ -134,6 +134,14 @@ pub(super) fn probe_metadata(
 
 fn task_link(entry: &str) -> Option<(&str, &str)> {
     let (link, tail) = entry.split_once('/').unwrap_or((entry, ""));
+    if link == "fd" {
+        let (number, rest) = tail.split_once('/')?;
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let link = &entry[..link.len() + 1 + number.len()]; // fd/N
+        return Some((link, rest.trim_start_matches('/')));
+    }
     matches!(link, "cwd" | "exe" | "root").then_some((link, tail.trim_start_matches('/')))
 }
 
