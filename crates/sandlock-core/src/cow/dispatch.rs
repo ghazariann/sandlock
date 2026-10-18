@@ -114,6 +114,11 @@ fn resolve_at_path_with_virtual(
     virtual_cwd: Option<&str>,
 ) -> String {
     if Path::new(path).is_absolute() {
+        // A descriptor path names a file the branch may own, under a spelling
+        // the workdir prefix never matches, so resolve it to where it lands.
+        if let Some(real) = crate::seccomp::notif::resolve_descriptor_path(notif, path, false) {
+            return normalize_path(real).to_string_lossy().into_owned();
+        }
         return normalize_path(PathBuf::from(path)).to_string_lossy().into_owned();
     }
     // dirfd is stored as u64 in seccomp_data.args but AT_FDCWD is a negative i32.

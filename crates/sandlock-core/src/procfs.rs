@@ -670,10 +670,17 @@ fn dev_fd_aliases() -> &'static [(&'static str, &'static str)] {
 /// The caller's own fd, when `path` is a request to reopen one: /proc/self/fd/N
 /// under any spelling of the caller's directory, or /dev/stdin and its kin.
 pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
+    let fd = own_fd_rest(path, tid, tgid)?;
+    fd.bytes().all(|b| b.is_ascii_digit()).then(|| fd.parse().ok()).flatten()
+}
+
+/// Everything after `fd/` when `path` names the caller's own descriptor table.
+fn own_fd_rest(path: &str, tid: i32, tgid: i32) -> Option<String> {
     let aliased = dev_fd_aliases().iter().find_map(|(alias, target)| {
         strip_dir_prefix(path, alias).map(|rest| format!("{}{}", target, rest))
     });
-    let target = own_proc_target(aliased.as_deref().unwrap_or(path), tid, tgid)?;
+    let spelled = aliased.unwrap_or_else(|| path.to_string());
+    let target = own_proc_target(&spelled, tid, tgid)?;
     let rest = match target.rest.strip_prefix("/task/") {
         Some(thread) => {
             let (thread, rest) = thread.split_once('/')?;
@@ -682,8 +689,18 @@ pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
         }
         None => target.rest.strip_prefix('/')?,
     };
-    let fd = rest.strip_prefix("fd/")?;
-    fd.bytes().all(|b| b.is_ascii_digit()).then(|| fd.parse().ok()).flatten()
+    Some(rest.strip_prefix("fd/")?.to_string())
+}
+
+/// The caller's own descriptor and what is named beneath it. `None` for a bare
+/// `/proc/<task>/fd/N`, which names the link rather than a file through it.
+pub(crate) fn own_fd_path_tail(path: &str, tid: i32, tgid: i32) -> Option<(i32, String)> {
+    let rest = own_fd_rest(path, tid, tgid)?;
+    let (fd, tail) = rest.split_once('/')?;
+    if tail.is_empty() || !fd.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((fd.parse().ok()?, tail.to_string()))
 }
 
 /// Serve a policy-listed open inside the caller's own /proc directory.

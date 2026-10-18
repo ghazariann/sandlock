@@ -367,6 +367,52 @@ async fn test_seccomp_cow_openat2_syscall() {
 
 /// renameat must land in the COW layer like rename and renameat2.
 ///
+/// A path through one of the caller's own descriptors names a file the branch
+/// owns, under a spelling that does not look like it, so the change belongs in
+/// the branch and an abort takes it back.
+#[tokio::test]
+async fn test_seccomp_cow_change_through_a_descriptor_path_is_staged() {
+    let workdir = temp_dir("seccomp-cow-descriptor-path");
+    fs::write(workdir.join("victim.txt"), b"precious").unwrap();
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-cow-descriptor-{}", std::process::id()
+    ));
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import os\n",
+        "dfd = os.open('{wd}', os.O_RDONLY | os.O_DIRECTORY)\n",
+        "fd = os.open(f'/proc/self/fd/{{dfd}}/created.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)\n",
+        "os.write(fd, b'x'); os.close(fd)\n",
+        "os.unlink(f'/proc/self/fd/{{dfd}}/victim.txt')\n",
+        "res = [open('{wd}/created.txt').read(), str(os.path.exists('{wd}/victim.txt'))]\n",
+        "open('{out}', 'w').write(','.join(res))\n",
+    ), wd = workdir.display(), out = out_file.display());
+
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    // Staged under the file's real name, so the sandbox reads it back there.
+    assert_eq!(fs::read_to_string(&out_file).unwrap_or_default(), "x,False");
+    assert!(!workdir.join("created.txt").exists(), "the create escaped the branch");
+    assert_eq!(
+        fs::read_to_string(workdir.join("victim.txt")).unwrap_or_default(),
+        "precious",
+        "the unlink escaped the branch",
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
 /// Regression test: COW registered renameat2 and legacy rename but not
 /// renameat, so a raw renameat under the workdir renamed the real file and
 /// survived an abort. On aarch64 libc's rename() compiles to renameat, so

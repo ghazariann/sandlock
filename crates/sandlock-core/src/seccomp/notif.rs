@@ -532,6 +532,56 @@ pub(crate) fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
     }
 }
 
+/// Where a path through one of the caller's own descriptors actually lands.
+///
+/// `/proc/<task>/fd/N/name` and `/dev/fd/N/name` name a file by the descriptor
+/// holding its directory, so the spelling says nothing about where the file is.
+/// The descriptor is taken from the caller's own table and the tail resolved
+/// beneath it, as the `/proc` metadata handler does for a task's other links.
+/// An entry that does not exist yet resolves through its parent.
+///
+/// `None` for a bare descriptor or a path that will not resolve.
+pub(crate) fn resolve_descriptor_path(
+    notif: &SeccompNotif,
+    path: &str,
+    follow: bool,
+) -> Option<std::path::PathBuf> {
+    let tid = notif.pid as i32;
+    let tgid = tgid_of(notif.pid).unwrap_or(notif.pid) as i32;
+    let (fd, tail) = crate::procfs::own_fd_path_tail(path, tid, tgid)?;
+    let base = open_base_dir(notif.pid, fd as i64).ok()?;
+    let nofollow = |last: bool| if last && !follow { libc::O_NOFOLLOW } else { 0 };
+
+    let c_tail = std::ffi::CString::new(tail.as_str()).ok()?;
+    if let Ok(entry) = openat2_at(
+        base.as_raw_fd(),
+        &c_tail,
+        (libc::O_PATH | libc::O_CLOEXEC | nofollow(true)) as u64,
+        0,
+        RESOLVE_NO_MAGICLINKS,
+    ) {
+        return realpath_of_fd(entry.as_raw_fd());
+    }
+
+    let (parent, last) = tail.rsplit_once('/').unwrap_or(("", tail.as_str()));
+    if last.is_empty() || last == "." || last == ".." {
+        return None;
+    }
+    if parent.is_empty() {
+        return Some(realpath_of_fd(base.as_raw_fd())?.join(last));
+    }
+    let c_parent = std::ffi::CString::new(parent).ok()?;
+    let parent = openat2_at(
+        base.as_raw_fd(),
+        &c_parent,
+        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        0,
+        RESOLVE_NO_MAGICLINKS,
+    )
+    .ok()?;
+    Some(realpath_of_fd(parent.as_raw_fd())?.join(last))
+}
+
 /// Real path of an open fd via its `/proc/self/fd` magic link.
 fn realpath_of_fd(fd: RawFd) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()
