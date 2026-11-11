@@ -115,15 +115,10 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "http-ca-out", value_name = "PATH"))]
     pub http_ca_out: Option<PathBuf>,
 
-    /// Optional observation callback for HTTP learn mode. When set, the proxy is
-    /// spawned even without ACL rules so every request is logged via this closure.
+    /// Optional observation callback. When set, the proxy is spawned even
+    /// without ACL rules so every request reaching it is observed.
     #[cfg_attr(feature = "cli", clap(skip))]
-    pub http_log_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
-
-    /// Optional callback given the body of every request that reaches the
-    /// proxy, in addition to method/host/path.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub http_body_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
+    pub http_observer: Option<crate::http::HttpObserver>,
 
     // max_memory uses a string in the CLI (e.g. "512M"); not directly clap-friendly as ByteSize.
     #[cfg_attr(feature = "cli", clap(skip))]
@@ -300,8 +295,7 @@ impl Default for SandboxBuilder {
             http_key: None,
             http_inject_ca: Vec::new(),
             http_ca_out: None,
-            http_log_fn: None,
-            http_body_fn: None,
+            http_observer: None,
             max_memory: None,
             max_processes: None,
             max_open_files: None,
@@ -368,8 +362,7 @@ impl Clone for SandboxBuilder {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
-            http_log_fn: self.http_log_fn.clone(),
-            http_body_fn: self.http_body_fn.clone(),
+            http_observer: self.http_observer.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -614,21 +607,12 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn http_log_fn(
-        mut self,
-        f: std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>,
-    ) -> Self {
-        self.http_log_fn = Some(f);
-        self
-    }
-
-    /// Observe the body of every request that reaches the proxy, with its
-    /// method, host and path. Independent of [`Self::http_log_fn`].
-    pub fn http_body_fn(
-        mut self,
-        f: std::sync::Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>,
-    ) -> Self {
-        self.http_body_fn = Some(f);
+    /// Observe every request that reaches the proxy, allowed or denied.
+    ///
+    /// The callback returns [`Some`] to receive that request's body as it
+    /// streams to the upstream, or [`None`] to skip it.
+    pub fn http_observer(mut self, f: crate::http::HttpObserver) -> Self {
+        self.http_observer = Some(f);
         self
     }
 
@@ -1101,8 +1085,7 @@ impl SandboxBuilder {
                 ("--http-ca-out", self.http_ca_out.is_some()),
                 ("--http-auth", !self.http_auth.is_empty()),
                 ("--credential", !self.credentials.is_empty()),
-                ("http_log_fn", self.http_log_fn.is_some()),
-                ("http_body_fn", self.http_body_fn.is_some()),
+                ("http_observer", self.http_observer.is_some()),
             ];
             if let Some((what, _)) = set.iter().find(|(_, on)| *on) {
                 return Err(SandboxError::FeatureDisabled {
@@ -1124,8 +1107,7 @@ impl SandboxBuilder {
         // callback exist.
         let has_http_rules = !self.http_allow.is_empty()
             || !self.http_deny.is_empty()
-            || self.http_log_fn.is_some()
-            || self.http_body_fn.is_some();
+            || self.http_observer.is_some();
         if !self.http_inject_ca.is_empty() && !has_http_rules {
             return Err(SandboxError::Invalid(
                 "--http-inject-ca requires --http-allow, --http-deny, or an observation callback"
@@ -1291,8 +1273,7 @@ impl SandboxBuilder {
             http_key: self.http_key,
             http_inject_ca: self.http_inject_ca,
             http_ca_out: self.http_ca_out,
-            http_log_fn: self.http_log_fn,
-            http_body_fn: self.http_body_fn,
+            http_observer: self.http_observer,
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,

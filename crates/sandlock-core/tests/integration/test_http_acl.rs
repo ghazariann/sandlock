@@ -802,7 +802,7 @@ async fn test_env_sourced_credential_stripped_from_child() {
 }
 
 // ============================================================
-// Observation callbacks: http_log_fn / http_body_fn
+// Observation callback: http_observer
 // ============================================================
 
 fn post_bytes_script(url: &str, body: &str, out: &std::path::Path) -> String {
@@ -825,11 +825,10 @@ fn post_bytes_script(url: &str, body: &str, out: &std::path::Path) -> String {
     )
 }
 
-/// `http_log_fn` observes method/host/path for every request that reaches
-/// the proxy, in addition to whatever ACL/forwarding decision it makes.
+/// An observer returning `None` still sees the request line and headers.
 #[tokio::test]
-async fn test_http_log_fn_records_requests() {
-    let out = temp_file("log-fn-records");
+async fn test_http_observer_records_requests() {
+    let out = temp_file("observer-records");
     let (port, srv) = spawn_http_server(1);
 
     let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
@@ -839,11 +838,13 @@ async fn test_http_log_fn_records_requests() {
     let policy = base_policy()
         .http_allow("GET 127.0.0.1/*")
         .http_port(port)
-        .http_log_fn(std::sync::Arc::new(move |method, host, path| {
-            seen_cb
-                .lock()
-                .unwrap()
-                .push(format!("{method} {host}{path}"));
+        .http_observer(std::sync::Arc::new(move |event| {
+            let ua = event.headers.contains_key("user-agent");
+            seen_cb.lock().unwrap().push(format!(
+                "{} {}{} allowed={} ua={}",
+                event.method, event.host, event.path, event.allowed, ua
+            ));
+            None
         }))
         .build()
         .unwrap();
@@ -861,12 +862,14 @@ async fn test_http_log_fn_records_requests() {
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
 
-    assert_eq!(seen.lock().unwrap().as_slice(), ["GET 127.0.0.1/get"]);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["GET 127.0.0.1/get allowed=true ua=true"]
+    );
 }
 
-/// Spawn a server that records the body of the one request it receives, for
-/// `http_body_fn` tests that need to tell the callback's view and the
-/// upstream's view of a request apart.
+/// Records the body of the one request it receives, so a test can tell the
+/// sink's view and the upstream's view apart.
 fn spawn_body_capturing_http_server() -> (
     u16,
     thread::JoinHandle<()>,
@@ -909,34 +912,35 @@ fn spawn_body_capturing_http_server() -> (
     (port, handle, captured)
 }
 
-/// `http_body_fn` sees exactly the bytes the child sent, and the upstream
-/// still receives the same, unmodified bytes.
+/// The sink receives the body, and the upstream receives it unmodified.
 #[tokio::test]
-async fn test_http_body_fn_receives_request_body() {
-    let out = temp_file("body-fn-receives");
+async fn test_http_observer_sink_receives_body() {
+    let out = temp_file("observer-sink");
     let (port, srv, upstream_got) = spawn_body_capturing_http_server();
 
-    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>> =
+    let teed: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let seen_cb = seen.clone();
+    let teed_cb = teed.clone();
 
     let policy = base_policy()
         .http_allow("POST 127.0.0.1/*")
         .http_port(port)
-        .http_body_fn(std::sync::Arc::new(move |method, host, path, body| {
-            seen_cb.lock().unwrap().push((
-                method.to_string(),
-                host.to_string(),
-                path.to_string(),
-                body.to_vec(),
-            ));
+        .http_observer(std::sync::Arc::new(move |event| {
+            assert_eq!(event.method, "POST");
+            assert_eq!(event.host, "127.0.0.1");
+            assert_eq!(event.path, "/upload");
+            assert!(event.allowed);
+            let acc = teed_cb.clone();
+            Some(Box::new(move |chunk: &[u8]| {
+                acc.lock().unwrap().extend_from_slice(chunk);
+            }))
         }))
         .build()
         .unwrap();
 
     let script = post_bytes_script(
         &format!("http://127.0.0.1:{}/upload", port),
-        "hello-body-fn",
+        "hello-observer",
         &out,
     );
     let result = policy
@@ -951,37 +955,40 @@ async fn test_http_body_fn_receives_request_body() {
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
 
-    let captured = seen.lock().unwrap();
-    assert_eq!(captured.len(), 1, "callback should fire exactly once");
-    let (method, host, path, body) = &captured[0];
-    assert_eq!(method, "POST");
-    assert_eq!(host, "127.0.0.1");
-    assert_eq!(path, "/upload");
-    assert_eq!(body, b"hello-body-fn");
-
+    assert_eq!(
+        teed.lock().unwrap().as_slice(),
+        b"hello-observer",
+        "the sink must see the body the child sent"
+    );
     assert_eq!(
         upstream_got.lock().unwrap().as_deref(),
-        Some(b"hello-body-fn".as_slice()),
+        Some(b"hello-observer".as_slice()),
         "upstream must still receive the unmodified body"
     );
 }
 
-/// A request the ACL blocks still reaches `http_body_fn`, so the body of an
-/// attempt is observable even though it is never forwarded.
+/// A blocked request is reported with `allowed` false, and its body unread.
 #[tokio::test]
-async fn test_http_body_fn_observes_denied_request() {
-    let out = temp_file("body-fn-denied");
+async fn test_http_observer_reports_denied_request() {
+    let out = temp_file("observer-denied");
     let (port, _srv, _got) = spawn_body_capturing_http_server();
 
-    let seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+    let verdicts: std::sync::Arc<std::sync::Mutex<Vec<bool>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let seen_cb = seen.clone();
+    let teed: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let verdicts_cb = verdicts.clone();
+    let teed_cb = teed.clone();
 
     let policy = base_policy()
         .http_allow("POST 127.0.0.1/allowed")
         .http_port(port)
-        .http_body_fn(std::sync::Arc::new(move |_m, _h, _p, body| {
-            seen_cb.lock().unwrap().push(body.to_vec());
+        .http_observer(std::sync::Arc::new(move |event| {
+            verdicts_cb.lock().unwrap().push(event.allowed);
+            let acc = teed_cb.clone();
+            Some(Box::new(move |chunk: &[u8]| {
+                acc.lock().unwrap().extend_from_slice(chunk);
+            }))
         }))
         .build()
         .unwrap();
@@ -1005,13 +1012,79 @@ async fn test_http_body_fn_observes_denied_request() {
     );
     let _ = std::fs::remove_file(&out);
 
-    let captured = seen.lock().unwrap();
     assert_eq!(
-        captured.len(),
-        1,
-        "body_fn should fire for a denied request"
+        verdicts.lock().unwrap().as_slice(),
+        [false],
+        "the denied request must be reported once, with allowed=false"
     );
-    assert_eq!(captured[0], b"blocked-prompt");
+    assert!(
+        teed.lock().unwrap().is_empty(),
+        "a denied request is never forwarded, so its body is never read"
+    );
+}
+
+/// A large body reaches the sink as several frames, and upstream whole.
+#[tokio::test]
+async fn test_http_observer_sink_receives_streamed_chunks() {
+    let out = temp_file("observer-chunks");
+    let (port, srv, upstream_got) = spawn_body_capturing_http_server();
+
+    let chunks: std::sync::Arc<std::sync::Mutex<Vec<usize>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chunks_cb = chunks.clone();
+
+    let policy = base_policy()
+        .http_allow("POST 127.0.0.1/*")
+        .http_port(port)
+        .http_observer(std::sync::Arc::new(move |_event| {
+            let acc = chunks_cb.clone();
+            Some(Box::new(move |chunk: &[u8]| {
+                acc.lock().unwrap().push(chunk.len());
+            }))
+        }))
+        .build()
+        .unwrap();
+
+    let size = 1_000_000usize;
+    let script = format!(
+        concat!(
+            "import urllib.request, urllib.error\n",
+            "body = b'x' * {size}\n",
+            "try:\n",
+            "    req = urllib.request.Request('{url}', method='POST', data=body)\n",
+            "    resp = urllib.request.urlopen(req)\n",
+            "    open('{out}', 'w').write('OK:' + str(resp.status))\n",
+            "except Exception as e:\n",
+            "    open('{out}', 'w').write('ERR:' + str(e))\n",
+        ),
+        size = size,
+        url = format!("http://127.0.0.1:{}/upload", port),
+        out = out.display(),
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(content.starts_with("OK:200"), "got: {}", content);
+    srv.join().unwrap();
+    let _ = std::fs::remove_file(&out);
+
+    let seen = chunks.lock().unwrap();
+    let total: usize = seen.iter().sum();
+    assert_eq!(total, size, "sink must see every byte");
+    assert!(
+        seen.len() > 1,
+        "expected several frames, got {}",
+        seen.len()
+    );
+    assert_eq!(
+        upstream_got.lock().unwrap().as_ref().map(|b| b.len()),
+        Some(size),
+        "upstream must receive the whole body"
+    );
 }
 
 // NOTE (RFC #66 follow-up): injection over the HTTPS/MITM path is not covered

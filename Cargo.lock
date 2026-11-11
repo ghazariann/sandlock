@@ -1409,6 +1409,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "goblin",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-rustls",

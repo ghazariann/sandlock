@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use super::upstream::{box_incoming, Forwarder};
 use crate::credential::InjectRule;
-use crate::http::{http_acl_check, HttpRule};
+use crate::http::{http_acl_check, HttpBodySink, HttpObserver, HttpRequestEvent, HttpRule};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type OrigDestMap = Arc<std::sync::RwLock<HashMap<SocketAddr, IpAddr>>>;
@@ -41,19 +41,48 @@ pub(crate) struct AclService {
     /// so a library/API caller gets the warning once per run instead of per
     /// request. See [`first_cleartext_warn`].
     cleartext_warned: Arc<AtomicBool>,
-    /// Optional observation callback for learn mode. Called with (method, host, path)
-    /// for every request after the host is validated, before the ACL check.
-    pub(crate) log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
-    /// Optional callback given the full request body, in addition to
-    /// (method, host, path).
-    pub(crate) body_fn: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
+    /// Called once per request, after the ACL has decided it.
+    pub(crate) observer: Option<HttpObserver>,
 }
 
-/// Truncate to the cap handed to `body_fn`, since the untrusted workload could
-/// otherwise force an arbitrarily large allocation into the callback's own storage.
-fn capped_for_body_fn(body: &[u8]) -> &[u8] {
-    const MAX_BODY_FN_BYTES: usize = 10 * 1024 * 1024;
-    &body[..body.len().min(MAX_BODY_FN_BYTES)]
+/// Copies each body chunk to a sink on its way to the upstream. Driven by the
+/// forward, so nothing is accumulated and an unforwarded body is unread.
+struct TeeBody<B> {
+    inner: B,
+    sink: HttpBodySink,
+}
+
+impl<B> hyper::body::Body for TeeBody<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    (this.sink)(data);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    /// Forwarded, or the upstream request loses the length and switches to chunked.
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
 }
 
 /// Whether this cleartext injection should emit the one-per-run warning: true the
@@ -113,8 +142,7 @@ impl AclService {
         inject: Arc<Vec<InjectRule>>,
         orig_dest: OrigDestMap,
         forwarder: Forwarder,
-        log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
-        body_fn: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
+        observer: Option<HttpObserver>,
     ) -> Self {
         Self {
             allow: Arc::new(allow),
@@ -124,8 +152,7 @@ impl AclService {
             forwarder,
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
             cleartext_warned: Arc::new(AtomicBool::new(false)),
-            log_fn,
-            body_fn,
+            observer,
         }
     }
 
@@ -212,36 +239,30 @@ impl AclService {
             m.remove(&client_addr);
         }
 
-        if let Some(ref f) = self.log_fn {
-            f(&method, &host, &path);
+        let allowed = http_acl_check(&self.allow, &self.deny, &method, &host, &path);
+
+        let sink = match self.observer {
+            Some(ref f) => f(&HttpRequestEvent {
+                method: &method,
+                host: &host,
+                path: &path,
+                headers: req.headers(),
+                allowed,
+            }),
+            None => None,
+        };
+
+        if !allowed {
+            return text_response(StatusCode::FORBIDDEN, "Blocked by sandlock HTTP ACL policy");
         }
 
         let (mut parts, body) = req.into_parts();
-
-        // Buffer the body once as `Bytes` (cheap to share) before forwarding.
-        // A read failure rejects the request: the headers still carry the
-        // original Content-Length, so forwarding a short body would stall the
-        // upstream waiting for bytes that never arrive.
-        let body = match self.body_fn {
-            Some(ref f) => {
-                let body_bytes = match body.collect().await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(_) => {
-                        return text_response(
-                            StatusCode::BAD_GATEWAY,
-                            "sandlock could not read the request body",
-                        )
-                    }
-                };
-                f(&method, &host, &path, capped_for_body_fn(&body_bytes));
-                Full::new(body_bytes).map_err(|e| match e {}).boxed()
-            }
+        let body = match sink {
+            Some(sink) => TeeBody { inner: body, sink }
+                .map_err(|e| Box::new(e) as BoxError)
+                .boxed(),
             None => box_incoming(body),
         };
-
-        if !http_acl_check(&self.allow, &self.deny, &method, &host, &path) {
-            return text_response(StatusCode::FORBIDDEN, "Blocked by sandlock HTTP ACL policy");
-        }
 
         // Rebuild an absolute-URI request for the upstream client from the SAME
         // validated authority — never the raw Host header — so the forward host

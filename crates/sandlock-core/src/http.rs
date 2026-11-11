@@ -3,6 +3,24 @@ use serde::{Deserialize, Serialize};
 use crate::error::SandboxError;
 use crate::network::{NetAllow, NetTarget, Protocol};
 
+/// One request observed by the proxy, borrowed for the duration of the call.
+pub struct HttpRequestEvent<'a> {
+    pub method: &'a str,
+    /// Validated authority, never the raw `Host` header.
+    pub host: &'a str,
+    pub path: &'a str,
+    pub headers: &'a ::http::HeaderMap,
+    pub allowed: bool,
+}
+
+/// Receives one request's body as it streams to the upstream.
+pub type HttpBodySink = Box<dyn FnMut(&[u8]) + Send + Sync>;
+
+/// Observes every request reaching the proxy. `Some` tees that request's body
+/// into the sink, `None` leaves it untouched.
+pub type HttpObserver =
+    std::sync::Arc<dyn Fn(&HttpRequestEvent) -> Option<HttpBodySink> + Send + Sync>;
+
 /// An HTTP access control rule.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HttpRule {

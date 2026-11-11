@@ -43,8 +43,7 @@ pub(crate) async fn spawn_transparent_proxy(
     _: Arc<Vec<crate::credential::InjectRule>>,
     _: Option<&str>,
     _: Option<&str>,
-    _: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
-    _: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
+    _: Option<crate::http::HttpObserver>,
 ) -> io::Result<HttpAclProxyHandle> {
     Err(disabled())
 }

@@ -807,13 +807,10 @@ pub struct Sandbox {
     /// Path to write the active MITM CA public cert (PEM) for external trust
     /// wiring (e.g. NODE_EXTRA_CA_CERTS). Never writes the private key.
     pub http_ca_out: Option<PathBuf>,
-    /// Optional observation callback for HTTP learn mode. When set the proxy is
-    /// spawned even without ACL rules; every request is logged via this closure.
+    /// Optional observation callback. When set the proxy is spawned even
+    /// without ACL rules.
     #[serde(skip)]
-    pub(crate) http_log_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
-    /// Optional callback given the body of every proxied request.
-    #[serde(skip)]
-    pub(crate) http_body_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
+    pub(crate) http_observer: Option<crate::http::HttpObserver>,
 
     // Resource limits
     pub max_memory: Option<ByteSize>,
@@ -976,8 +973,7 @@ impl Clone for Sandbox {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
-            http_log_fn: self.http_log_fn.clone(),
-            http_body_fn: self.http_body_fn.clone(),
+            http_observer: self.http_observer.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -2444,10 +2440,7 @@ impl Sandbox {
         );
 
         let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
-        if !self.http_allow.is_empty()
-            || !self.http_deny.is_empty()
-            || self.http_log_fn.is_some()
-            || self.http_body_fn.is_some()
+        if !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_observer.is_some()
         {
             // Generate an ephemeral CA when injection is requested without BYO.
             let generate = !self.http_inject_ca.is_empty();
@@ -2481,8 +2474,7 @@ impl Sandbox {
                 std::sync::Arc::clone(&self.inject),
                 cert_pem,
                 key_pem,
-                self.http_log_fn.clone(),
-                self.http_body_fn.clone(),
+                self.http_observer.clone(),
             )
             .await
             .map_err(SandboxRuntimeError::Io)?;
