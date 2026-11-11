@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::SandboxError;
 use crate::network::{NetAllow, NetTarget, Protocol};
 
+/// Re-exported so an observer can name the type without depending on `http`.
+pub use ::http::HeaderMap;
+
 /// One request observed by the proxy, borrowed for the duration of the call.
 pub struct HttpRequestEvent<'a> {
     pub method: &'a str,
@@ -13,13 +16,33 @@ pub struct HttpRequestEvent<'a> {
     pub allowed: bool,
 }
 
-/// Receives one request's body as it streams to the upstream.
+/// One upstream response, borrowed for the duration of the call.
+pub struct HttpResponseEvent<'a> {
+    pub status: u16,
+    pub headers: &'a ::http::HeaderMap,
+}
+
+/// Receives one body as it streams, in either direction.
 pub type HttpBodySink = Box<dyn FnMut(&[u8]) + Send + Sync>;
 
-/// Observes every request reaching the proxy. `Some` tees that request's body
-/// into the sink, `None` leaves it untouched.
-pub type HttpObserver =
-    std::sync::Arc<dyn Fn(&HttpRequestEvent) -> Option<HttpBodySink> + Send + Sync>;
+/// Called once, when the response status and headers exist, which is later than
+/// the observer runs. Returns a sink to tee that response's body, or `None`.
+pub type HttpResponseHook = Box<dyn FnOnce(&HttpResponseEvent) -> Option<HttpBodySink> + Send>;
+
+/// What an observer asks for. Both sinks are chosen while the request is still
+/// in scope, so a consumer correlates the two bodies by what it captures.
+#[derive(Default)]
+pub struct HttpSinks {
+    /// `Some` tees the request body, `None` leaves it untouched.
+    pub request: Option<HttpBodySink>,
+    /// `Some` is called with the upstream response, and may then tee its body.
+    /// A denied request has no upstream response, so this is never called; the
+    /// child still receives sandlock's 403.
+    pub response: Option<HttpResponseHook>,
+}
+
+/// Observes every request reaching the proxy.
+pub type HttpObserver = std::sync::Arc<dyn Fn(&HttpRequestEvent) -> HttpSinks + Send + Sync>;
 
 /// An HTTP access control rule.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

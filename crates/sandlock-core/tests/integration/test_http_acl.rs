@@ -844,7 +844,7 @@ async fn test_http_observer_records_requests() {
                 "{} {}{} allowed={} ua={}",
                 event.method, event.host, event.path, event.allowed, ua
             ));
-            None
+            sandlock_core::http::HttpSinks::default()
         }))
         .build()
         .unwrap();
@@ -931,9 +931,12 @@ async fn test_http_observer_sink_receives_body() {
             assert_eq!(event.path, "/upload");
             assert!(event.allowed);
             let acc = teed_cb.clone();
-            Some(Box::new(move |chunk: &[u8]| {
-                acc.lock().unwrap().extend_from_slice(chunk);
-            }))
+            sandlock_core::http::HttpSinks {
+                request: Some(Box::new(move |chunk: &[u8]| {
+                    acc.lock().unwrap().extend_from_slice(chunk);
+                })),
+                response: None,
+            }
         }))
         .build()
         .unwrap();
@@ -986,9 +989,12 @@ async fn test_http_observer_reports_denied_request() {
         .http_observer(std::sync::Arc::new(move |event| {
             verdicts_cb.lock().unwrap().push(event.allowed);
             let acc = teed_cb.clone();
-            Some(Box::new(move |chunk: &[u8]| {
-                acc.lock().unwrap().extend_from_slice(chunk);
-            }))
+            sandlock_core::http::HttpSinks {
+                request: Some(Box::new(move |chunk: &[u8]| {
+                    acc.lock().unwrap().extend_from_slice(chunk);
+                })),
+                response: None,
+            }
         }))
         .build()
         .unwrap();
@@ -1038,9 +1044,12 @@ async fn test_http_observer_sink_receives_streamed_chunks() {
         .http_port(port)
         .http_observer(std::sync::Arc::new(move |_event| {
             let acc = chunks_cb.clone();
-            Some(Box::new(move |chunk: &[u8]| {
-                acc.lock().unwrap().push(chunk.len());
-            }))
+            sandlock_core::http::HttpSinks {
+                request: Some(Box::new(move |chunk: &[u8]| {
+                    acc.lock().unwrap().push(chunk.len());
+                })),
+                response: None,
+            }
         }))
         .build()
         .unwrap();
@@ -1084,6 +1093,68 @@ async fn test_http_observer_sink_receives_streamed_chunks() {
         upstream_got.lock().unwrap().as_ref().map(|b| b.len()),
         Some(size),
         "upstream must receive the whole body"
+    );
+}
+
+/// The response hook sees the upstream status, and its sink receives the
+/// response body.
+#[tokio::test]
+async fn test_http_observer_response_hook_tees_body() {
+    let out = temp_file("observer-response");
+    let (port, srv, _upstream_got) = spawn_body_capturing_http_server();
+
+    let status: std::sync::Arc<std::sync::Mutex<Option<u16>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let resp_body: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let status_cb = status.clone();
+    let resp_body_cb = resp_body.clone();
+
+    let policy = base_policy()
+        .http_allow("POST 127.0.0.1/*")
+        .http_port(port)
+        .http_observer(std::sync::Arc::new(move |_event| {
+            let seen_status = status_cb.clone();
+            let acc = resp_body_cb.clone();
+            sandlock_core::http::HttpSinks {
+                request: None,
+                response: Some(Box::new(move |resp| {
+                    *seen_status.lock().unwrap() = Some(resp.status);
+                    Some(Box::new(move |chunk: &[u8]| {
+                        acc.lock().unwrap().extend_from_slice(chunk);
+                    }))
+                })),
+            }
+        }))
+        .build()
+        .unwrap();
+
+    let script = post_bytes_script(
+        &format!("http://127.0.0.1:{}/upload", port),
+        "hello-response",
+        &out,
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(content.starts_with("OK:200"), "got: {}", content);
+
+    srv.join().unwrap();
+    let _ = std::fs::remove_file(&out);
+
+    assert_eq!(
+        *status.lock().unwrap(),
+        Some(200),
+        "the hook must see the upstream status"
+    );
+    assert_eq!(
+        resp_body.lock().unwrap().as_slice(),
+        b"ok",
+        "the sink must see the response body"
     );
 }
 

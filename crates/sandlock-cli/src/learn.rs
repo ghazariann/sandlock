@@ -644,7 +644,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
                 .lock()
                 .unwrap()
                 .insert(format!("{} {}{}", event.method, event.host, event.path));
-            None
+            sandlock_core::http::HttpSinks::default()
         });
         builder = builder.http_observer(http_observer);
     }

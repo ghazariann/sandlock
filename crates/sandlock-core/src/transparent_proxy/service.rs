@@ -16,7 +16,10 @@ use tokio::sync::Mutex;
 
 use super::upstream::{box_incoming, Forwarder};
 use crate::credential::InjectRule;
-use crate::http::{http_acl_check, HttpBodySink, HttpObserver, HttpRequestEvent, HttpRule};
+use crate::http::{
+    http_acl_check, HttpBodySink, HttpObserver, HttpRequestEvent, HttpResponseEvent, HttpRule,
+    HttpSinks,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type OrigDestMap = Arc<std::sync::RwLock<HashMap<SocketAddr, IpAddr>>>;
@@ -241,7 +244,7 @@ impl AclService {
 
         let allowed = http_acl_check(&self.allow, &self.deny, &method, &host, &path);
 
-        let sink = match self.observer {
+        let sinks = match self.observer {
             Some(ref f) => f(&HttpRequestEvent {
                 method: &method,
                 host: &host,
@@ -249,15 +252,20 @@ impl AclService {
                 headers: req.headers(),
                 allowed,
             }),
-            None => None,
+            None => HttpSinks::default(),
         };
 
         if !allowed {
             return text_response(StatusCode::FORBIDDEN, "Blocked by sandlock HTTP ACL policy");
         }
 
+        let HttpSinks {
+            request: req_sink,
+            response: resp_hook,
+        } = sinks;
+
         let (mut parts, body) = req.into_parts();
-        let body = match sink {
+        let body = match req_sink {
             Some(sink) => TeeBody { inner: body, sink }
                 .map_err(|e| Box::new(e) as BoxError)
                 .boxed(),
@@ -341,10 +349,24 @@ impl AclService {
 
         let out_req = Request::from_parts(parts, body);
 
-        match self.forwarder.forward(out_req).await {
+        let resp = match self.forwarder.forward(out_req).await {
             Ok(resp) => resp,
-            Err(_) => text_response(StatusCode::BAD_GATEWAY, "upstream error"),
-        }
+            Err(_) => return text_response(StatusCode::BAD_GATEWAY, "upstream error"),
+        };
+
+        let Some(hook) = resp_hook else {
+            return resp;
+        };
+        let (parts, body) = resp.into_parts();
+        let sink = hook(&HttpResponseEvent {
+            status: parts.status.as_u16(),
+            headers: &parts.headers,
+        });
+        let body = match sink {
+            Some(sink) => TeeBody { inner: body, sink }.boxed(),
+            None => body,
+        };
+        Response::from_parts(parts, body)
     }
 }
 
